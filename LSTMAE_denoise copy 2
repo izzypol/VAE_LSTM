@@ -1,0 +1,168 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.init as init
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+import math
+
+# Set random seeds for reproducibility
+torch.manual_seed(50)
+np.random.seed(50)
+
+# Step 1: Generate Complex Synthetic Dataset
+def generate_complex_sequence(length=50, num_sequences=1000, noise_factor=0.5):
+    x = np.linspace(0, 4 * np.pi, length)
+
+    # Create complex clean signal by combining sinusoids of different frequencies
+    clean_sequences = np.array([
+        np.sin(x + np.random.uniform(0, 2 * np.pi)) +
+        0.5 * np.sin(2 * x + np.random.uniform(0, 2 * np.pi)) +
+        0.25 * np.sin(4 * x + np.random.uniform(0, 2 * np.pi))
+        for _ in range(num_sequences)
+    ])
+
+    # Add complex noise: Gaussian noise + occasional spikes + uniform noise
+    gaussian_noise = noise_factor * np.random.normal(size=clean_sequences.shape)
+    spike_noise = np.random.choice([0, 1], size=clean_sequences.shape, p=[0.98, 0.02]) * np.random.uniform(-3, 3, size=clean_sequences.shape)
+    uniform_noise = noise_factor * np.random.uniform(-1, 1, size=clean_sequences.shape)
+
+    noisy_sequences = clean_sequences + gaussian_noise + spike_noise + uniform_noise
+    return torch.tensor(noisy_sequences, dtype=torch.float32), torch.tensor(clean_sequences, dtype=torch.float32)
+
+# Generate data
+noisy_data, clean_data = generate_complex_sequence()
+train_noisy, test_noisy, train_clean, test_clean = train_test_split(noisy_data, clean_data, test_size=0.2)
+
+# the lines above are just to create the noisy data so dont need to touch it 
+
+# Step 2: Define the Autoencoder Model with Initialization
+# remplace de denoiser ae par denoising vae
+#encoder decoder et reparamétrisation (sorti de l'encodeur et définir une variable aélatoire aka reparamétrisation trick)
+class DenoisingVAE(nn.Module):
+    def __init__(self, input_size, hidden_size, latent_dim=32):
+        super(DenoisingVAE, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU()
+        )
+
+        self.fc_mu = nn.Linear(hidden_size // 2, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_size // 2, latent_dim)
+        
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, input_size)
+        )
+        self.latent_dim = latent_dim
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def reparameterize(self, mu, logvar):
+        """
+        fct qui permet de faire le reparameterization trick N(0,1) -> N(mu, var) 
+        
+        :param mu: moyenne
+        :param logvar: log variance
+
+        return: variable aléatoire échantillonnée selon N(mu, var)
+        """
+
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(self, x):
+        encoded = self.encoder(x)
+        mu = self.fc_mu(encoded)
+        logvar = self.fc_logvar(encoded)
+        z = self.reparameterize(mu, logvar)
+        decoded = self.decoder(z)
+        return decoded, mu, logvar
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                init.zeros_(module.bias)
+
+
+# determine the VAE loss (dif from normal MSE)
+def vae_loss(recon, x, mu, logvar):
+    recon_loss = F.mse_loss(recon, x)
+
+    # add the kl divergence which makes it diff from the loss in a normal ae
+    kl_loss = -0.5*(1+logvar-(mu**2)-logvar.exp()).mean()
+
+    # calculate the loss
+    loss = recon_loss + 0.1*kl_loss
+    return loss 
+
+# Model, loss function, and optimizer
+input_size = train_noisy.shape[1]
+hidden_size = 64
+latent_dim = 32
+model = DenoisingVAE(input_size, hidden_size, latent_dim)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+# Step 3: Train the Autoencoder
+num_epochs = 1000
+batch_size = 32
+
+for epoch in range(num_epochs):
+    for i in range(0, len(train_noisy), batch_size):
+        batch_noisy = train_noisy[i:i+batch_size]
+        batch_clean = train_clean[i:i+batch_size]
+
+        # Forward pass
+        outputs, mu, logvar = model(batch_noisy)
+        loss = vae_loss(outputs, batch_clean, mu, logvar)
+
+        # Backward and optimize
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    if (epoch+1) % 10 == 0:
+        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}')
+
+# Step 4: Visualize Results
+def visualize_results(model, noisy_data, clean_data, num_samples=100):
+    model.eval()
+    with torch.no_grad():
+        # Sample multiple reconstructions to estimate uncertainty
+        samples = []
+        for _ in range(num_samples):
+            output, _, _ = model(noisy_data)
+            samples.append(output)
+        samples = torch.stack(samples)  # Shape: (num_samples, batch_size, seq_len)
+        
+        # Compute mean and standard deviation across samples
+        mean_outputs = samples.mean(dim=0)
+        std_outputs = samples.std(dim=0)
+        
+        # Compute lines at mean ± 2*std (approximating 2.5% and 97.5% percentiles for a normal distribution)
+        lower = mean_outputs - 2 * std_outputs
+        upper = mean_outputs + 2 * std_outputs
+
+    fig, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+    for i in range(3):
+        axs[i].plot(noisy_data[i].numpy(), label='Noisy Input')
+        axs[i].plot(mean_outputs[i].numpy(), label='Mean Denoised Output', linestyle='dashed')
+        axs[i].plot(lower[i].numpy(), label='Mean - 2*Std (≈2.5%)', linestyle='dotted', color='red')
+        axs[i].plot(upper[i].numpy(), label='Mean + 2*Std (≈97.5%)', linestyle='dotted', color='green')
+        axs[i].legend()
+        axs[i].set_title(f'Sequence {i+1}')
+
+    plt.xlabel('Time Step')
+    plt.show()
+
+# Visualize on test data
+visualize_results(model, test_noisy, test_clean)

@@ -1,0 +1,117 @@
+import torch
+import torch.nn as nn
+import torch.nn.init as init
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+
+# Set random seeds for reproducibility
+torch.manual_seed(50)
+np.random.seed(50)
+
+# Step 1: Generate Complex Synthetic Dataset
+def generate_complex_sequence(length=50, num_sequences=1000, noise_factor=0.5):
+    x = np.linspace(0, 4 * np.pi, length)
+
+    # Create complex clean signal by combining sinusoids of different frequencies
+    clean_sequences = np.array([
+        np.sin(x + np.random.uniform(0, 2 * np.pi)) +
+        0.5 * np.sin(2 * x + np.random.uniform(0, 2 * np.pi)) +
+        0.25 * np.sin(4 * x + np.random.uniform(0, 2 * np.pi))
+        for _ in range(num_sequences)
+    ])
+
+    # Add complex noise: Gaussian noise + occasional spikes + uniform noise
+    gaussian_noise = noise_factor * np.random.normal(size=clean_sequences.shape)
+    spike_noise = np.random.choice([0, 1], size=clean_sequences.shape, p=[0.98, 0.02]) * np.random.uniform(-3, 3, size=clean_sequences.shape)
+    uniform_noise = noise_factor * np.random.uniform(-1, 1, size=clean_sequences.shape)
+
+    noisy_sequences = clean_sequences + gaussian_noise + spike_noise + uniform_noise
+    return torch.tensor(noisy_sequences, dtype=torch.float32), torch.tensor(clean_sequences, dtype=torch.float32)
+
+# Generate data
+noisy_data, clean_data = generate_complex_sequence()
+train_noisy, test_noisy, train_clean, test_clean = train_test_split(noisy_data, clean_data, test_size=0.2)
+
+# the lines above are just to create the noisy data so dont need to touch it 
+
+# Step 2: Define the Autoencoder Model with Initialization
+# remplace de denoiser ae par denoising vae
+#encoder decoder et reparamétrisation (sorti de l'encodeur et définir une variable aélatoire aka reparamétrisation trick)
+class DenoisingAutoencoder(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(DenoisingAutoencoder, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU()
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_size // 2, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, input_size)
+        )
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def forward(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            init.xavier_uniform_(module.weight)  # Xavier initialization for weights
+            if module.bias is not None:
+                init.zeros_(module.bias)  # Initialize biases to zero
+
+# Model, loss function, and optimizer
+input_size = train_noisy.shape[1]
+hidden_size = 64
+model = DenoisingAutoencoder(input_size, hidden_size)
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+# Step 3: Train the Autoencoder
+num_epochs = 1000
+batch_size = 32
+
+for epoch in range(num_epochs):
+    for i in range(0, len(train_noisy), batch_size):
+        batch_noisy = train_noisy[i:i+batch_size]
+        batch_clean = train_clean[i:i+batch_size]
+
+        # Forward pass
+        outputs = model(batch_noisy)
+        loss = criterion(outputs, batch_clean)
+
+        # Backward and optimize
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    if (epoch+1) % 10 == 0:
+        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}')
+
+# Step 4: Visualize Results
+def visualize_results(model, noisy_data, clean_data):
+    model.eval()
+    with torch.no_grad():
+        test_outputs = model(noisy_data)
+
+    fig, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+    for i in range(3):
+        axs[i].plot(noisy_data[i].numpy(), label='Abnormal noisy Input')
+        axs[i].plot(clean_data[i].numpy(), label='Clean Sequence')
+        axs[i].plot(test_outputs[i].numpy(), label='Denoised Output', linestyle='dashed')
+        axs[i].legend()
+        axs[i].set_title(f'Sequence {i+1}')
+
+    plt.xlabel('Time Step2')
+    plt.show()
+
+# Visualize on test data
+visualize_results(model, test_noisy, test_clean)
+     

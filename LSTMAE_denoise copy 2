@@ -80,6 +80,13 @@ class DenoisingVAE(nn.Module):
         return mu + eps * std
 
     def forward(self, x):
+        """
+        ft qui permet de faire le forward pass
+        
+        :param x: input
+
+        return: résultat du forward et les variables du latent space (mu et logvar)
+        """
         encoded = self.encoder(x)
         mu = self.fc_mu(encoded)
         logvar = self.fc_logvar(encoded)

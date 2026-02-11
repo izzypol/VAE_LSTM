@@ -1,5 +1,7 @@
 import torch.nn as nn
 
+# https://github.com/matanle51/LSTM_AutoEncoder/blob/master/models/LSTMAE.py
+
 # encoder class
 class Encoder(nn.Module):
     def __init__(self, input_size, hidden_size, dropout, seq_len):

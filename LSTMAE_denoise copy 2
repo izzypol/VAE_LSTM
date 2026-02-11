@@ -5,7 +5,6 @@ import torch.nn.init as init
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
-import math
 
 # Set random seeds for reproducibility
 torch.manual_seed(50)
@@ -41,7 +40,7 @@ train_noisy, test_noisy, train_clean, test_clean = train_test_split(noisy_data, 
 # remplace de denoiser ae par denoising vae
 #encoder decoder et reparamétrisation (sorti de l'encodeur et définir une variable aélatoire aka reparamétrisation trick)
 class DenoisingVAE(nn.Module):
-    def __init__(self, input_size, hidden_size, latent_dim=32):
+    def __init__(self, input_size, hidden_size, latent_dim=2): # dim petite = plsu comprimer et lissé, on essai de choisir la plus petite taille possible qui donner la meilleur réponse
         super(DenoisingVAE, self).__init__()
         self.encoder = nn.Sequential(
             nn.Linear(input_size, hidden_size),
@@ -58,7 +57,7 @@ class DenoisingVAE(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_size // 2, hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_size, input_size)
+            nn.Linear(hidden_size, input_size) # le fait de dire inoput_size indique que c'est autoencoder, si c'était 1 ou autre ces des catégories (requiert changement de fct pert)
         )
         self.latent_dim = latent_dim
 
@@ -68,6 +67,7 @@ class DenoisingVAE(nn.Module):
     def reparameterize(self, mu, logvar):
         """
         fct qui permet de faire le reparameterization trick N(0,1) -> N(mu, var) 
+        parti qui conient roch.randn_like!!
         
         :param mu: moyenne
         :param logvar: log variance
@@ -82,6 +82,8 @@ class DenoisingVAE(nn.Module):
     def forward(self, x):
         """
         ft qui permet de faire le forward pass
+        encoder: partie déterministe
+        décoder: partie probabiliste
         
         :param x: input
 
@@ -94,7 +96,7 @@ class DenoisingVAE(nn.Module):
         decoded = self.decoder(z)
         return decoded, mu, logvar
 
-    def _init_weights(self, module):
+    def _init_weights(self, module): # a changer pcq plus nécessaire avec lstm (pas linéaire)
         if isinstance(module, nn.Linear):
             init.xavier_uniform_(module.weight)
             if module.bias is not None:
@@ -103,19 +105,23 @@ class DenoisingVAE(nn.Module):
 
 # determine the VAE loss (dif from normal MSE)
 def vae_loss(recon, x, mu, logvar):
-    recon_loss = F.mse_loss(recon, x)
+    recon_loss = F.mse_loss(recon, x) # changeemnt ici pour la balance
 
     # add the kl divergence which makes it diff from the loss in a normal ae
+    # si = 0 distr égale, plus grande plus les distr sont divergente, on veut que ca tende vers 0
     kl_loss = -0.5*(1+logvar-(mu**2)-logvar.exp()).mean()
 
     # calculate the loss
+    # 0,1 pour faire balace entre les deux losses, mais meux de faire poid de 1 (le vrai)
+    # strat pour que la balance se fait automatiquement (à chercher)
+    # faire varier le poid pour voir l'effet
     loss = recon_loss + 0.1*kl_loss
     return loss 
 
 # Model, loss function, and optimizer
 input_size = train_noisy.shape[1]
 hidden_size = 64
-latent_dim = 32
+latent_dim = 32 # faire varier ausi 
 model = DenoisingVAE(input_size, hidden_size, latent_dim)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
@@ -162,13 +168,14 @@ def visualize_results(model, noisy_data, clean_data, num_samples=100):
     fig, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
     for i in range(3):
         axs[i].plot(noisy_data[i].numpy(), label='Noisy Input')
+        axs[i].plot(clean_data[i].numpy(), label='Clean Input')
         axs[i].plot(mean_outputs[i].numpy(), label='Mean Denoised Output', linestyle='dashed')
         axs[i].plot(lower[i].numpy(), label='Mean - 2*Std (≈2.5%)', linestyle='dotted', color='red')
         axs[i].plot(upper[i].numpy(), label='Mean + 2*Std (≈97.5%)', linestyle='dotted', color='green')
         axs[i].legend()
         axs[i].set_title(f'Sequence {i+1}')
 
-    plt.xlabel('Time Step')
+    plt.xlabel('Time Step 0')
     plt.show()
 
 # Visualize on test data

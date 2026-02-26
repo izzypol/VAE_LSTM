@@ -1,0 +1,420 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.init as init
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+
+# Set random seeds for reproducibility
+torch.manual_seed(50)
+np.random.seed(50)
+
+# Step 1: Generate Complex Synthetic Dataset
+def generate_complex_sequence(length=50, num_sequences=1000, noise_factor=0.5):
+    x = np.linspace(0, 4 * np.pi, length)
+
+    # Create complex clean signal by combining sinusoids of different frequencies
+    clean_sequences = np.array([
+        np.sin(x + np.random.uniform(0, 2 * np.pi)) +
+        0.5 * np.sin(2 * x + np.random.uniform(0, 2 * np.pi)) +
+        0.25 * np.sin(4 * x + np.random.uniform(0, 2 * np.pi))
+        for _ in range(num_sequences)
+    ])
+
+    # Add complex noise: Gaussian noise + occasional spikes + uniform noise
+    gaussian_noise = noise_factor * np.random.normal(size=clean_sequences.shape)
+    spike_noise = np.random.choice([0, 1], size=clean_sequences.shape, p=[0.98, 0.02]) * np.random.uniform(-3, 3, size=clean_sequences.shape)
+    uniform_noise = noise_factor * np.random.uniform(-1, 1, size=clean_sequences.shape)
+
+    noisy_sequences = clean_sequences + gaussian_noise + spike_noise + uniform_noise
+    return torch.tensor(noisy_sequences, dtype=torch.float32), torch.tensor(clean_sequences, dtype=torch.float32)
+
+# Generate data
+noisy_data, clean_data = generate_complex_sequence()
+train_noisy, test_noisy, train_clean, test_clean = train_test_split(noisy_data, clean_data, test_size=0.2)
+
+# the lines above are just to create the noisy data so dont need to touch it 
+
+# Step 2: Define the Autoencoder Model with Initialization
+# remplace de denoiser ae par denoising vae
+#encoder decoder et reparamétrisation (sorti de l'encodeur et définir une variable aélatoire aka reparamétrisation trick)
+class DenoisingVAE(nn.Module):
+    def __init__(self, input_size, hidden_size, latent_dim=2, device=None): # dim petite = plsu comprimer et lissé, on essai de choisir la plus petite taille possible qui donner la meilleur réponse
+        super(DenoisingVAE, self).__init__()
+        self.device = device if device is not None else torch.device("cpu")
+        self.encoder = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU()
+        )
+
+        self.fc_mu = nn.Linear(hidden_size // 2, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_size // 2, latent_dim)
+        
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, input_size) # le fait de dire inoput_size indique que c'est autoencoder, si c'était 1 ou autre ces des catégories (requiert changement de fct pert)
+        )
+        self.latent_dim = latent_dim
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def reparameterize(self, mu, logvar):
+        """
+        fct qui permet de faire le reparameterization trick N(0,1) -> N(mu, var) 
+        parti qui conient roch.randn_like!!
+        
+        :param mu: moyenne
+        :param logvar: log variance
+
+        return: variable aléatoire échantillonnée selon N(mu, var)
+        """
+
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(self, x):
+        """
+        ft qui permet de faire le forward pass
+        encoder: partie déterministe
+        décoder: partie probabiliste
+        
+        :param x: input
+
+        return: résultat du forward et les variables du latent space (mu et logvar)
+        """
+        encoded = self.encoder(x)
+        mu = self.fc_mu(encoded)
+        logvar = self.fc_logvar(encoded)
+        z = self.reparameterize(mu, logvar)
+        decoded = self.decoder(z)
+        loss = self.loss_fct(decoded, x, mu, logvar)
+        m_loss, recon_loss, kld_loss = (
+            loss["loss"], 
+            loss["recon_loss"],
+            loss["KLD"]
+        )
+        return m_loss, decoded, (recon_loss, kld_loss)
+
+    def _init_weights(self, module): # a changer pcq plus nécessaire avec lstm (pas linéaire)
+        if isinstance(module, nn.Linear):
+            init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                init.zeros_(module.bias)
+
+
+    def gaussian_nnl(self, mu, log_sigma, x):
+        return 0.5*torch.pow((x-mu) / log_sigma.exp(), 2) + log_sigma+ 0.5 * torch.tensor(2*np.pi).log()
+
+    def softclip(self, tensor, min):
+        """ Clips the tensor values at the minimum value min in a softway. Taken from Handful of Trials """
+        result_tensor = min + F.softplus(tensor - min)
+        return result_tensor
+        
+    # determine the VAE loss (dif from normal MSE)
+    def loss_fct(self, *args) -> dict:
+        """
+        calc le lorss VAE
+        """
+        recons = args[0]
+        input = args[1]
+        mu = args[2]
+        logvar = args[3]
+
+        # reconstruction loss part
+        self.log_sigma = ((input - recons) ** 2).mean().sqrt().log() 
+        log_sigma = self.softclip(self.log_sigma, -6)
+        recons_loss = self.gaussian_nnl(recons, log_sigma, input).sum()
+
+        # kld loss part
+        kld_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+
+        # total loss
+        loss = recons_loss + kld_loss 
+
+        return {'loss': loss, "recon_loss": recons_loss.detach(), "KLD": kld_loss.detach()} 
+
+class encoderLSTM(nn.Module):
+    """
+    Le code est séparé en les calcul et le forward 
+    """
+    def __init__(self, input_size, hidden_size, num_layers):
+        """
+        fct qui encode l'input en utilisant LSTM
+        
+        :param input_size: taille de l'input
+        :param hidden_size: taille du hidden layer
+        :param num_layers: nombre de couches
+
+        return: résultat encodé
+        """
+        super(encoderLSTM, self).__init__()
+        # resortir les param
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, bidirectional=False)
+
+    def forward(self, x):
+        """
+        Dfct qui permet de faire le forward pass
+
+        :param x: input (batch_size, seq_len, input_size)
+        """
+        ouputs, (hidden, cell) = self.lstm(x) # on a pas besoin de outputs mais lstm le sort quand même 
+        return (hidden, cell)
+
+class decoderLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=2):
+        """
+        fct qui decode le latent variable z
+        
+        :param input_size: taille de l'input -- this isnt necessayr??
+        :param hidden_size: taille du hidden layer
+        :param output_size: taille de l'output
+        :param num_layers: nombre de couches
+
+
+        return: reconstruction de l'input
+        """
+        super(decoderLSTM, self).__init__()
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, bidirectional=False)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x, hidden): 
+        """
+        fct qui permet de faire le forward pass
+        
+        :param x: input (batch_size, seq_len, hidden_size)"""
+
+        output, (hidden, cell) = self.lstm(x, hidden)
+        prediction = self.fc(output)
+
+        return prediction, (hidden, cell)
+
+class LSTMVAE(nn.Module):
+    def __init__(self, input_size, hidden_size, latent_size, device=None):
+        """
+        début du model lstmvae
+        :param input_size: int batch_size*seq_len*input_dim
+        :param hidden_size: int, output size of LSTMAE
+        :param latent_size: int, latent z_layer size
+        :param device: torch device (cpu or cuda)"""
+        super(LSTMVAE, self).__init__()
+        self.device = device if device is not None else torch.device("cpu")
+
+        # resortir les params
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.latent_size = latent_size
+        self.num_layers = 1 # peut être varier pour rafiner 
+        
+        # encodeur
+        self.lstm_enc = encoderLSTM(
+            input_size = input_size, hidden_size = hidden_size, num_layers=self.num_layers)
+        
+        # les deux prochaines lignes sont pour calculer mu et logvar 
+        self.fc21 = nn.Linear(self.hidden_size, self.latent_size) # utilise affine linear transf y = x AT + b
+        self.fc22 = nn.Linear(self.hidden_size, self.latent_size)
+
+        # décodeur
+        self.lstm_dec = decoderLSTM(
+            input_size=latent_size, output_size=input_size, hidden_size=hidden_size, 
+            num_layers=self.num_layers)
+        
+        self.fc3 = nn.Linear(self.latent_size, self.hidden_size) 
+        self.log_sigma = torch.zeros([])
+
+
+    def reparameterize(self, mu, logvar):
+        """
+        fct qui permet de faire le reparameterization trick N(0,1) -> N(mu, var) 
+        
+        :param mu: moyenne
+        :param logvar: log variance
+
+        return: variable aléatoire échantillonnée selon N(mu, var)
+        """
+
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std).to(self.device)
+        return mu + eps * std
+
+    def forward(self,x):
+        batch_size, seq_len, feature_dim = x.shape
+
+        # encoder le input
+        enc_hidden, enc_cell = self.lstm_enc(x)
+        enc_h = enc_hidden[0].view(batch_size, self.hidden_size).to(self.device)
+
+        # calc mu et logvar
+        mu = self.fc21(enc_h)
+        logvar = self.fc22(enc_h)
+        z = self.reparameterize(mu, logvar)
+
+        # init le hidden state avec inputs
+        h_ = self.fc3(z)
+        c_ = torch.zeros_like(h_)  # Initialize cell state
+
+        # decode le latent space
+        z = z.repeat(1, seq_len, 1)
+        z = z.view(batch_size, seq_len, self.latent_size).to(self.device)
+
+        # init le hidden state
+        hidden = (h_.unsqueeze(0).contiguous(), c_.unsqueeze(0).contiguous())
+        recon_output, hidden = self.lstm_dec(z, hidden)
+
+        x_hat = recon_output
+
+        # calc le loss
+        loss = self.loss_fct(x_hat, x, mu, logvar)
+        m_loss, recon_loss, kld_loss = (
+            loss["loss"], 
+            loss["recon_loss"],
+            loss["KLD"]
+        )
+
+        return m_loss, x_hat, (recon_loss, kld_loss)
+
+    def gaussian_nnl(self, mu, log_sigma, x):
+        return 0.5*torch.pow((x-mu) / log_sigma.exp(), 2) + log_sigma+ 0.5 * torch.tensor(2*np.pi).log()
+
+    def softclip(self, tensor, min):
+        """ Clips the tensor values at the minimum value min in a softway. Taken from Handful of Trials """
+        result_tensor = min + F.softplus(tensor - min)
+        return result_tensor
+        
+    # determine the VAE loss (dif from normal MSE)
+    def loss_fct(self, *args) -> dict:
+        """
+        calc le lorss VAE
+        """
+        recons = args[0]
+        input = args[1]
+        mu = args[2]
+        logvar = args[3]
+
+        # reconstruction loss part
+        self.log_sigma = ((input - recons) ** 2).mean().sqrt().log() 
+        log_sigma = self.softclip(self.log_sigma, -6)
+        recons_loss = self.gaussian_nnl(recons, log_sigma, input).sum()
+
+        # kld loss part
+        kld_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+
+        # total loss
+        loss = recons_loss + kld_loss 
+
+        return {'loss': loss, "recon_loss": recons_loss.detach(), "KLD": kld_loss.detach()}
+
+
+# Model, loss function, and optimizer
+input_size = train_noisy.shape[1]
+hidden_size = 64
+latent_dim = 5 # faire varier ausi 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+modelLSTMVAE = LSTMVAE(input_size, hidden_size, latent_dim, device=device).to(device)
+modelVAE = DenoisingVAE(input_size, hidden_size, latent_dim, device=device).to(device)
+optimizerVAE = torch.optim.Adam(modelVAE.parameters(), lr=0.001)
+optimizerLSTMVAE = torch.optim.Adam(modelLSTMVAE.parameters(), lr=0.001)
+
+# Step 3: Train the Autoencoder
+num_epochs = 500
+batch_size = 32
+
+train_clean_gpu = train_clean.unsqueeze(2).to(device)  # Pre-move data to device
+train_noisy_gpu = train_noisy.unsqueeze(2).to(device)
+
+# save the values of loss, recon loss and kls loss for a graph later
+lossVAE_tot = []
+reconVAE_tot = []
+kldVAE_tot = []
+
+lossLSTMVAE_tot = []
+reconLSTMVAE_tot = []
+kldLSTMVAE_tot = []
+
+modelVAE.train()
+modelLSTMVAE.train()
+for epoch in range(num_epochs):
+    totalVAE_loss = 0
+    totalLSTMVAE_loss = 0
+    num_batches = 0
+    for i in range(0, len(train_noisy), batch_size):
+        batch_noisy = train_noisy_gpu[i:i+batch_size]
+        batch_clean = train_clean_gpu[i:i+batch_size]
+
+        # Forward pass VAE
+        lossVAE, x_hatVAE, (reconVAE_loss, kldVAE_loss)= modelVAE(batch_noisy)
+        lossVAE_tot.append(lossVAE.item())
+        reconVAE_tot.append(reconVAE_loss.item())
+        kldVAE_tot.append(kldVAE_loss.item())
+
+        # forward pass LSTMVAE
+        lossLSTMVAE, x_hatLSTMVAE, (reconLSTMVAE_loss, kldLSTMVAE_loss)= modelLSTMVAE(batch_noisy)
+        lossLSTMVAE_tot.append(lossLSTMVAE.item())
+        reconLSTMVAE_tot.append(reconLSTMVAE_loss.item())
+        kldLSTMVAE_tot.append(kldLSTMVAE_loss.item())
+
+        # Backward and optimize VAE
+        optimizerVAE.zero_grad()
+        lossVAE.backward()
+        optimizerVAE.step()
+
+        # Backward and optimize LSTMVAE
+        optimizerLSTMVAE.zero_grad()
+        lossLSTMVAE.backward()
+        optimizerLSTMVAE.step()
+
+        totalVAE_loss += lossVAE.item()
+        totalLSTMVAE_loss += lossLSTMVAE.item()
+        num_batches += 1
+
+    if (epoch+1) % 10 == 0:
+        avg_lossVAE = totalVAE_loss / num_batches
+        avg_lossLSTMVAE = totalLSTMVAE_loss / num_batches
+        print(f'Epoch [{epoch+1}/{num_epochs}], VAE Loss: {avg_lossVAE:.4f}, LSTMVAE Loss: {avg_lossLSTMVAE:.4f}')
+
+# Step 4: Visualize Results
+def visualize_results(model, noisy_data, clean_data, num_samples=100):
+    model.eval()
+    with torch.no_grad():
+        # Sample multiple reconstructions to estimate uncertainty
+        samples = []
+        for _ in range(num_samples):
+            output, _, _ = model(noisy_data)
+            samples.append(output)
+        samples = torch.stack(samples)  # Shape: (num_samples, batch_size, seq_len)
+        
+        # Compute mean and standard deviation across samples
+        mean_outputs = samples.mean(dim=0)
+        std_outputs = samples.std(dim=0)
+        
+        # Compute lines at mean ± 2*std (approximating 2.5% and 97.5% percentiles for a normal distribution)
+        lower = mean_outputs - 2 * std_outputs
+        upper = mean_outputs + 2 * std_outputs
+
+    fig, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+    for i in range(3):
+        axs[i].plot(noisy_data[i].numpy(), label='Noisy Input')
+        axs[i].plot(clean_data[i].numpy(), label='Clean Input')
+        axs[i].plot(mean_outputs[i].numpy(), label='Mean Denoised Output', linestyle='dashed')
+        axs[i].plot(lower[i].numpy(), label='Mean - 2*Std (≈2.5%)', linestyle='dotted', color='red')
+        axs[i].plot(upper[i].numpy(), label='Mean + 2*Std (≈97.5%)', linestyle='dotted', color='green')
+        axs[i].legend()
+        axs[i].set_title(f'Sequence {i+1}')
+
+    plt.xlabel('Time Step 0')
+    plt.show()
+
+# Visualize on test data
+visualize_results(model, test_noisy, test_clean)

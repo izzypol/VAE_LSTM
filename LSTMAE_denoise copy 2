@@ -147,7 +147,7 @@ for epoch in range(num_epochs):
         print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}')
 
 # Step 4: Visualize Results
-def visualize_results(model, noisy_data, clean_data, num_samples=100):
+def visualize_results(model, noisy_data, num_samples=100):
     model.eval()
     with torch.no_grad():
         # Sample multiple reconstructions to estimate uncertainty
@@ -168,7 +168,7 @@ def visualize_results(model, noisy_data, clean_data, num_samples=100):
     fig, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
     for i in range(3):
         axs[i].plot(noisy_data[i].numpy(), label='Noisy Input')
-        axs[i].plot(clean_data[i].numpy(), label='Clean Input')
+        # axs[i].plot(clean_data[i].numpy(), label='Clean Input')
         axs[i].plot(mean_outputs[i].numpy(), label='Mean Denoised Output', linestyle='dashed')
         axs[i].plot(lower[i].numpy(), label='Mean - 2*Std (≈2.5%)', linestyle='dotted', color='red')
         axs[i].plot(upper[i].numpy(), label='Mean + 2*Std (≈97.5%)', linestyle='dotted', color='green')
@@ -179,4 +179,4 @@ def visualize_results(model, noisy_data, clean_data, num_samples=100):
     plt.show()
 
 # Visualize on test data
-visualize_results(model, test_noisy, test_clean)
+visualize_results(model, test_noisy)

@@ -1,48 +1,32 @@
 import torch
 import torch.nn as nn
+import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 import math
+import pandas as pd
 
-# Set random seeds for reproducibility
-torch.manual_seed(50)
-np.random.seed(50)
 
-# Step 1: Generate Complex Synthetic Dataset
-def generate_complex_sequence(length=50, num_sequences=1000, noise_factor=0.5):
-    x = np.linspace(0, 4 * np.pi, length)
+# import data 
+df1 = pd.read_csv('test_stat974.csv')
+df2 = pd.read_csv("test_stat393.csv")
+Vstack1_value = df1['Vstack_value'].values
+Vstack2_value = df2['Vstack_value'].values
+Istack1_value = df1['Istack_value'].values
+Istack2_value = df2['Istack_value'].values
 
-    # Create complex clean signal by combining sinusoids of different frequencies
-    clean_sequences = np.array([
-        np.sin(x + np.random.uniform(0, 2 * np.pi)) +
-        0.5 * np.sin(2 * x + np.random.uniform(0, 2 * np.pi)) +
-        0.25 * np.sin(4 * x + np.random.uniform(0, 2 * np.pi))
-        for _ in range(num_sequences)
-    ])
+# combine the data and convert to tensor
+Vstack_value = np.vstack((Vstack1_value, Vstack2_value))
+Istack_value = np.vstack((Istack1_value, Istack2_value))
+Vstack_value = torch.tensor(Vstack_value, dtype=torch.float32)
+Istack_value = torch.tensor(Istack_value, dtype=torch.float32)
 
-    # Add complex noise: Gaussian noise + occasional spikes + uniform noise
-    gaussian_noise = noise_factor * np.random.normal(size=clean_sequences.shape)
-    spike_noise = np.random.choice([0, 1], size=clean_sequences.shape, p=[0.98, 0.02]) * np.random.uniform(-3, 3, size=clean_sequences.shape)
-    uniform_noise = noise_factor * np.random.uniform(-1, 1, size=clean_sequences.shape)
-
-    noisy_sequences = clean_sequences + gaussian_noise + spike_noise + uniform_noise
-    return torch.tensor(noisy_sequences, dtype=torch.float32), torch.tensor(clean_sequences, dtype=torch.float32)
-
-# Generate data
-noisy_data, clean_data = generate_complex_sequence()
-train_noisy, test_noisy, train_clean, test_clean = train_test_split(noisy_data, clean_data, test_size=0.2)
-
-# the lines above are just to create the noisy data so dont need to touch it 
-
-# Step 2: Define the Autoencoder Model with Initialization
-# remplace de denoiser ae par denoising vae
-#encoder decoder et reparamétrisation (sorti de l'encodeur et définir une variable aélatoire aka reparamétrisation trick)
-
-# cette version du code sépare l'encodeur et le décodeur en classes et fonctions différentes ce qui permet d'être plus claire 
-# notice que la fct init poids n'est plus là 
+# separate the real data in train and test
+train_vstack, test_vstack, train_istack, test_istack = train_test_split(Vstack_value, Istack_value, test_size=0.2)
 
 class encoder(nn.Module):
     """
@@ -58,11 +42,16 @@ class encoder(nn.Module):
 
         return: résultat encodé
         """
+        print("encoder", input_size, hidden_size)
         super(encoder, self).__init__()
+
         # resortir les param
         self.hidden_size = hidden_size
+        print("test 1")
         self.num_layers = num_layers
+        print("test 2")
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, bidirectional=False)
+        print("test 3")
 
     def forward(self, x):
         """
@@ -70,7 +59,8 @@ class encoder(nn.Module):
 
         :param x: input (batch_size, seq_len, input_size)
         """
-        outputs, (hidden, cell) = self.lstm(x)
+        ouputs, (hidden, cell) = self.lstm(x) # on a pas besoin de outputs mais lstm le sort quand même
+        print("encoder forward hidden shape", hidden.shape, "cell", cell.shape) 
         return (hidden, cell)
 
 class decoder(nn.Module):
@@ -86,12 +76,18 @@ class decoder(nn.Module):
 
         return: reconstruction de l'input
         """
+        print("decoder", input_size, hidden_size, output_size)
         super(decoder, self).__init__()
         self.hidden_size = hidden_size
+        print("test 4")
         self.output_size = output_size
+        print("test 5")
         self.num_layers = num_layers
+        print("test 6")
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, bidirectional=False)
+        print("test 7 ")
         self.fc = nn.Linear(hidden_size, output_size)
+        print("test 8 ")
 
     def forward(self, x, hidden): 
         """
@@ -99,8 +95,12 @@ class decoder(nn.Module):
         
         :param x: input (batch_size, seq_len, hidden_size)"""
 
+        print("decoder input x", x.shape)
+
         output, (hidden, cell) = self.lstm(x, hidden)
         prediction = self.fc(output)
+
+        print("decoder output shape", output.shape, "prediction shape", prediction.shape)
 
         return prediction, (hidden, cell)
 
@@ -119,21 +119,27 @@ class LSTMVAE(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.latent_size = latent_size
-        self.num_layers = 1
+        self.num_layers = 1 # peut être varier pour rafiner 
+        print("LSTMVAE", input_size, hidden_size, latent_size)
         
         # encodeur
         self.lstm_enc = encoder(
             input_size = input_size, hidden_size = hidden_size, num_layers=self.num_layers)
+        print("test 9")
         
+        # les deux prochaines lignes sont pour calculer mu et logvar 
+        self.fc21 = nn.Linear(self.hidden_size, self.latent_size) # utilise affine linear transf y = x AT + b
+        self.fc22 = nn.Linear(self.hidden_size, self.latent_size)
+        print("test 10")
+
         # décodeur
         self.lstm_dec = decoder(
             input_size=latent_size, output_size=input_size, hidden_size=hidden_size, 
             num_layers=self.num_layers)
-        # les deux prochaines lignes sont pour calculer mu et logvar 
-        # comment est-ce que ça fct?
-        self.fc21 = nn.Linear(self.hidden_size, self.latent_size) # utilise affine linear transf y = x AT + b
-        self.fc22 = nn.Linear(self.hidden_size, self.latent_size)
-        self.fc3 = nn.Linear(self.latent_size, self.hidden_size) # est-ce que c'est encore nécessaire d'utilier linéaire à la fin?
+        print("test 11")
+        
+        self.fc3 = nn.Linear(self.latent_size, self.hidden_size) 
+        self.log_sigma = torch.zeros([])
 
 
     def reparameterize(self, mu, logvar):
@@ -145,12 +151,14 @@ class LSTMVAE(nn.Module):
 
         return: variable aléatoire échantillonnée selon N(mu, var)
         """
+        print("reparameterize mu shape", mu.shape, "logvar shape", logvar.shape)
 
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std).to(self.device)
         return mu + eps * std
 
     def forward(self,x):
+        print("LSTMVAE forward input x", x.type)
         batch_size, seq_len, feature_dim = x.shape
 
         # encoder le input
@@ -186,9 +194,16 @@ class LSTMVAE(nn.Module):
 
         return m_loss, x_hat, (recon_loss, kld_loss)
 
+    def gaussian_nnl(self, mu, log_sigma, x):
+        return 0.5*torch.pow((x-mu) / log_sigma.exp(), 2) + log_sigma+ 0.5 * torch.tensor(2*np.pi).log()
 
+    def softclip(self, tensor, min):
+        """ Clips the tensor values at the minimum value min in a softway. Taken from Handful of Trials """
+        result_tensor = min + F.softplus(tensor - min)
+        return result_tensor
+        
     # determine the VAE loss (dif from normal MSE)
-    def loss_fct(self, *args, **kwargs) -> dict:
+    def loss_fct(self, *args) -> dict:
         """
         calc le lorss VAE
         """
@@ -197,41 +212,50 @@ class LSTMVAE(nn.Module):
         mu = args[2]
         logvar = args[3]
 
-        kld_weight = 0.01
-        recons_loss = F.mse_loss(recons, input)
+        # reconstruction loss part
+        self.log_sigma = ((input - recons) ** 2).mean().sqrt().log() 
+        log_sigma = self.softclip(self.log_sigma, -6)
+        recons_loss = self.gaussian_nnl(recons, log_sigma, input).sum()
 
-        # add the kl divergence which makes it diff from the loss in a normal ae
-        kld_loss = torch.mean(-0.5 * torch.sum(1 + logvar - mu**2 - logvar.exp(), dim=1), dim=0)
+        # kld loss part
+        kld_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
-        # calculate the loss
-        loss = recons_loss + kld_weight*kld_loss
+        # total loss
+        loss = recons_loss + kld_loss 
+
         return {'loss': loss, "recon_loss": recons_loss.detach(), "KLD": kld_loss.detach()}
 
 # question: what would be seq len and other stuff for our data!!!!!
 # Step 2b: Model, loss function, and optimizer
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-input_size = 1  # Each sequence has a single feature value at each timestep, this line is what you would modify to make it 3d
-hidden_size = 64 # qu'est-ce qu'on veut mettre pour les données pp? 
-latent_dim = 2
-model = LSTMVAE(input_size, hidden_size, latent_dim, device=device).to(device) # le .to(device) est pour l'efficacité 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # chercher pourquoi cuda fct pas
+input_size = 1  # laisse à 1 pcq on a seulement le voltage, mais possiblement 2 dans le futur 
+hidden_size = 64 # qu'est-ce qu'on veut mettre pour les données pp? mettre qqch comparable au nombres de points dans la séquence
+latent_dim = 5
+model = LSTMVAE(input_size, hidden_size, latent_dim, device=device).to(device) # le .to(device) est pour l'efficacité de calcul
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 # Step 3: Train the Autoencoder
-num_epochs = 1000
+num_epochs = 500
 batch_size = 32
-train_noisy_gpu = train_noisy.unsqueeze(2).to(device)  # Pre-move data to device
-train_clean_gpu = train_clean.unsqueeze(2).to(device)
+train_vstack_gpu = train_vstack.to(device)  # Pre-move data to device (already 3D)
+
+# save the values of loss, recon loss and kls loss for a graph later
+loss_tot = []
+recon_tot = []
+kld_tot = []
 
 model.train()  # Set to training mode
 for epoch in range(num_epochs):
     total_loss = 0
     num_batches = 0
-    for i in range(0, len(train_noisy_gpu), batch_size):
-        batch_noisy = train_noisy_gpu[i:i+batch_size]
-        batch_clean = train_clean_gpu[i:i+batch_size]
+    for i in range(0, len(train_vstack_gpu), batch_size):
+        batch_noisy = train_vstack_gpu[i:i+batch_size]
 
         # Forward pass
         loss, x_hat, (recon_loss, kld_loss) = model(batch_noisy)
+        loss_tot.append(loss.item())
+        recon_tot.append(recon_loss.item())
+        kld_tot.append(kld_loss.item())
 
         # Backward and optimize
         optimizer.zero_grad()
@@ -246,13 +270,21 @@ for epoch in range(num_epochs):
         print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}')
 
 # Step 4: Visualize Results
-def visualize_results(model, noisy_data, clean_data, device, num_samples=100, batch_size=10):
-    """Efficiently generate multiple samples by batch processing latent codes."""
+def visualize_results(model, vstack_data, device, num_samples=100, batch_size=10):
     model.eval()
     with torch.no_grad():
-        noisy_test = noisy_data[:3].unsqueeze(2).to(device)  # Shape: (3, seq_len, 1)
+        # Ensure vstack_data is a Torch tensor with shape (B, S, F)
+        if not isinstance(vstack_data, torch.Tensor):
+            vstack_data = torch.tensor(vstack_data, dtype=torch.float32)
+        if vstack_data.dim() == 1:
+            vstack_data = vstack_data
+        elif vstack_data.dim() == 2:
+            vstack_data = vstack_data
+        vstack_data = vstack_data.to(device)
+
+        noisy_test = vstack_data[:3]  # Shape: (3, seq_len, feature_dim)
         batch_size_test, seq_len, feature_dim = noisy_test.shape
-        
+
         # Encode once to get mu and logvar
         enc_hidden, enc_cell = model.lstm_enc(noisy_test)
         enc_h = enc_hidden[0].view(batch_size_test, model.hidden_size).to(device)
@@ -271,7 +303,7 @@ def visualize_results(model, noisy_data, clean_data, device, num_samples=100, ba
             recon_output, _ = model.lstm_dec(z_expanded, hidden)
             samples.append(recon_output)
         
-        samples = torch.stack(samples).squeeze(-1)  # Shape: (num_samples, batch_size, seq_len)
+        samples = torch.stack(samples)  # Shape: (num_samples, batch_size, seq_len, feat)
         
         # Compute statistics across samples
         mean_outputs = samples.mean(dim=0)
@@ -281,9 +313,8 @@ def visualize_results(model, noisy_data, clean_data, device, num_samples=100, ba
 
     fig, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
     for i in range(3):
-        axs[i].plot(noisy_data[i].numpy(), label='Noisy Input', alpha=0.7)
-        axs[i].plot(clean_data[i].numpy(), label='Clean Input', alpha=0.7)
-        axs[i].plot(mean_outputs[i].cpu().numpy(), label='Mean Denoised', linestyle='dashed', linewidth=2)
+        axs[i].plot(vstack_data[i].numpy(), label='Raw data', alpha=0.7)
+        axs[i].plot(mean_outputs[i].cpu().numpy(), label='Denoised', linestyle='dashed', linewidth=2)
         axs[i].fill_between(range(seq_len), 
                              lower[i].cpu().numpy(), upper[i].cpu().numpy(),
                              alpha=0.2, color='green', label='±2σ Confidence')
@@ -294,5 +325,16 @@ def visualize_results(model, noisy_data, clean_data, device, num_samples=100, ba
     plt.tight_layout()
     plt.show()
 
-# Visualize on test data
-visualize_results(model, test_noisy, test_clean, device)
+    fig2, axs2 = plt.subplots(1, 1, figsize=(10, 8), sharex=True)
+    axs2.plot(loss_tot, label='Total loss', alpha=0.7)
+    axs2.plot(recon_tot, label='Recontruction loss', alpha=0.7)
+    axs2.plot(kld_tot, label='KLD loss', alpha=0.7)
+    axs2.legend()
+    axs2.set_title('Evolution of loss throughout training')
+
+    plt.xlabel('Optimization step')
+    plt.tight_layout()
+    plt.show()
+
+# Visualize on test and train data (pass both if desired)
+visualize_results(model, train_vstack, test_vstack, device=device)

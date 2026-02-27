@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 import torch.nn.functional as F
 import pandas as pd
+from matplotlib.font_manager import FontProperties
 
 # Set random seeds for reproducibility
 torch.manual_seed(50)
@@ -161,7 +162,7 @@ model = LSTMVAE(seq_len, n_features, hidden_dim, latent_dim)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 # training hyperparameters
-num_epochs = 500
+num_epochs = 1000
 batch_size = 32
 
 # save the values of loss, recon loss and kls loss for a graph later
@@ -204,14 +205,29 @@ def visualize_results(model, noisy_data):
     #clean = clean_data.squeeze(-1).cpu().numpy()
     pred = recon.squeeze(-1).cpu().numpy()
 
-    fig, axs = plt.subplots(1, 1, figsize=(10, 8))
-    axs.plot(noisy[0], label='Abnormal noisy Input')
+    # set the font
+    font = FontProperties(family="Times new roman")
+
+    fig, axs = plt.subplots(1, 1, figsize=(4, 4))
+    axs.plot(noisy[1], label='Abnormal noisy Input')
     #axs.plot(clean[1], label='Clean Sequence')
-    axs.plot(pred[0], label='Reconstructed', linestyle='dashed')
+    axs.plot(pred[1], label='Reconstructed', linestyle='dashed')
     axs.legend()
     axs.set_title(f'Sequence Reconstruction')
+    plt.ylabel('Potential (V)')
+    plt.xlabel('Time Step (ms)')
+    plt.show()
 
-    plt.xlabel('Time Step2')
+    fig2, axs2 = plt.subplots(1, 1, figsize=(4, 4))
+    axs2.plot(loss_tot, label='Total loss', alpha=0.7)
+    axs2.plot(recon_tot, label='Recontruction loss', alpha=0.7)
+    axs2.plot(kld_tot, label='Kullback–Leibler divergence', alpha=0.7)
+    axs2.legend(fontsize=8)
+    axs2.set_title('Evolution of loss throughout training')
+
+    plt.ylabel('Loss value')
+    plt.xlabel('Optimization step')
+    plt.tight_layout()
     plt.show()
 
 # Visualize on test data

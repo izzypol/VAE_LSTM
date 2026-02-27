@@ -34,13 +34,7 @@ def generate_complex_sequence(length=50, num_sequences=1000, noise_factor=0.5):
 noisy_data, clean_data = generate_complex_sequence()
 train_noisy, test_noisy, train_clean, test_clean = train_test_split(noisy_data, clean_data, test_size=0.2)
 
-# the lines above are just to create the noisy data so dont need to touch it 
-
-# Step 2: Define the Autoencoder Model with Initialization
-# remplace de denoiser ae par denoising vae
-#encoder decoder et reparamétrisation (sorti de l'encodeur et définir une variable aélatoire aka reparamétrisation trick)
-
-class encoderLSTM(nn.Module):
+class encoder(nn.Module):
     """
     Le code est séparé en les calcul et le forward 
     """
@@ -54,11 +48,16 @@ class encoderLSTM(nn.Module):
 
         return: résultat encodé
         """
-        super(encoderLSTM, self).__init__()
+        print("encoder", input_size, hidden_size)
+        super(encoder, self).__init__()
+
         # resortir les param
         self.hidden_size = hidden_size
+        print("test 1")
         self.num_layers = num_layers
+        print("test 2")
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, bidirectional=False)
+        print("test 3")
 
     def forward(self, x):
         """
@@ -66,10 +65,11 @@ class encoderLSTM(nn.Module):
 
         :param x: input (batch_size, seq_len, input_size)
         """
-        ouputs, (hidden, cell) = self.lstm(x) # on a pas besoin de outputs mais lstm le sort quand même 
+        ouputs, (hidden, cell) = self.lstm(x) # on a pas besoin de outputs mais lstm le sort quand même
+        print("encoder forward hidden shape", hidden.shape, "cell", cell.shape) 
         return (hidden, cell)
 
-class decoderLSTM(nn.Module):
+class decoder(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, num_layers=2):
         """
         fct qui decode le latent variable z
@@ -82,12 +82,18 @@ class decoderLSTM(nn.Module):
 
         return: reconstruction de l'input
         """
-        super(decoderLSTM, self).__init__()
+        print("decoder", input_size, hidden_size, output_size)
+        super(decoder, self).__init__()
         self.hidden_size = hidden_size
+        print("test 4")
         self.output_size = output_size
+        print("test 5")
         self.num_layers = num_layers
+        print("test 6")
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, bidirectional=False)
+        print("test 7 ")
         self.fc = nn.Linear(hidden_size, output_size)
+        print("test 8 ")
 
     def forward(self, x, hidden): 
         """
@@ -95,8 +101,12 @@ class decoderLSTM(nn.Module):
         
         :param x: input (batch_size, seq_len, hidden_size)"""
 
+        print("decoder input x", x.shape)
+
         output, (hidden, cell) = self.lstm(x, hidden)
         prediction = self.fc(output)
+
+        print("decoder output shape", output.shape, "prediction shape", prediction.shape)
 
         return prediction, (hidden, cell)
 
@@ -116,19 +126,23 @@ class LSTMVAE(nn.Module):
         self.hidden_size = hidden_size
         self.latent_size = latent_size
         self.num_layers = 1 # peut être varier pour rafiner 
+        print("LSTMVAE", input_size, hidden_size, latent_size)
         
         # encodeur
-        self.lstm_enc = encoderLSTM(
+        self.lstm_enc = encoder(
             input_size = input_size, hidden_size = hidden_size, num_layers=self.num_layers)
+        print("test 9")
         
         # les deux prochaines lignes sont pour calculer mu et logvar 
         self.fc21 = nn.Linear(self.hidden_size, self.latent_size) # utilise affine linear transf y = x AT + b
         self.fc22 = nn.Linear(self.hidden_size, self.latent_size)
+        print("test 10")
 
         # décodeur
-        self.lstm_dec = decoderLSTM(
+        self.lstm_dec = decoder(
             input_size=latent_size, output_size=input_size, hidden_size=hidden_size, 
             num_layers=self.num_layers)
+        print("test 11")
         
         self.fc3 = nn.Linear(self.latent_size, self.hidden_size) 
         self.log_sigma = torch.zeros([])
@@ -143,12 +157,14 @@ class LSTMVAE(nn.Module):
 
         return: variable aléatoire échantillonnée selon N(mu, var)
         """
+        print("reparameterize mu shape", mu.shape, "logvar shape", logvar.shape)
 
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std).to(self.device)
         return mu + eps * std
 
     def forward(self,x):
+        print("LSTMVAE forward input x", x.type)
         batch_size, seq_len, feature_dim = x.shape
 
         # encoder le input
@@ -215,56 +231,50 @@ class LSTMVAE(nn.Module):
 
         return {'loss': loss, "recon_loss": recons_loss.detach(), "KLD": kld_loss.detach()}
 
-
 # Model, loss function, and optimizer
-input_size = train_noisy.shape[1]
-hidden_size = 64
-latent_dim = 5 # faire varier ausi 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-modelLSTMVAE = LSTMVAE(input_size, hidden_size, latent_dim, device=device).to(device)
-optimizerLSTMVAE = torch.optim.Adam(modelLSTMVAE.parameters(), lr=0.001)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # chercher pourquoi cuda fct pas
+input_size = 1  # laisse à 1 pcq on a seulement le voltage, mais possiblement 2 dans le futur 
+hidden_size = 64 # qu'est-ce qu'on veut mettre pour les données pp? mettre qqch comparable au nombres de points dans la séquence
+latent_dim = 5
+model = LSTMVAE(input_size, hidden_size, latent_dim, device=device).to(device) # le .to(device) est pour l'efficacité de calcul
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 # Step 3: Train the Autoencoder
 num_epochs = 500
-batch_size = 32
-
-train_clean_gpu = train_clean.unsqueeze(2).to(device)  # Pre-move data to device
-train_noisy_gpu = train_noisy.unsqueeze(2).to(device)
+batch_size = 2
+train_vstack_gpu = train_noisy.to(device)  # Pre-move data to device (already 3D)
 
 # save the values of loss, recon loss and kls loss for a graph later
+loss_tot = []
+recon_tot = []
+kld_tot = []
 
-lossLSTMVAE_tot = []
-reconLSTMVAE_tot = []
-kldLSTMVAE_tot = []
-
-modelLSTMVAE.train()
+model.train()  # Set to training mode
 for epoch in range(num_epochs):
-    totalVAE_loss = 0
-    totalLSTMVAE_loss = 0
+    total_loss = 0
     num_batches = 0
-    for i in range(0, len(train_noisy), batch_size):
-        batch_noisy = train_noisy_gpu[i:i+batch_size]
-        batch_clean = train_clean_gpu[i:i+batch_size]
+    for i in range(0, len(train_vstack_gpu), batch_size):
+        batch_noisy = train_vstack_gpu[i:i+batch_size]
 
-        # forward pass LSTMVAE
-        lossLSTMVAE, x_hatLSTMVAE, (reconLSTMVAE_loss, kldLSTMVAE_loss)= modelLSTMVAE(batch_noisy)
-        lossLSTMVAE_tot.append(lossLSTMVAE.item())
-        reconLSTMVAE_tot.append(reconLSTMVAE_loss.item())
-        kldLSTMVAE_tot.append(kldLSTMVAE_loss.item())
+        # Forward pass
+        loss, x_hat, (recon_loss, kld_loss) = model(batch_noisy)
+        loss_tot.append(loss.item())
+        recon_tot.append(recon_loss.item())
+        kld_tot.append(kld_loss.item())
 
-        # Backward and optimize LSTMVAE
-        optimizerLSTMVAE.zero_grad()
-        lossLSTMVAE.backward()
-        optimizerLSTMVAE.step()
-        totalLSTMVAE_loss += lossLSTMVAE.item()
+        # Backward and optimize
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item()
         num_batches += 1
 
     if (epoch+1) % 10 == 0:
-        avg_lossLSTMVAE = totalLSTMVAE_loss / num_batches
-        print(f'Epoch [{epoch+1}/{num_epochs}], LSTMVAE Loss: {avg_lossLSTMVAE:.4f}')
-
+        avg_loss = total_loss / num_batches
+        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}')
 # Step 4: Visualize Results
-def visualize_results(model, noisy_data, clean_data, num_samples=100):
+def visualize_results(model, noisy_data, num_samples=100):
     model.eval()
     with torch.no_grad():
         # Sample multiple reconstructions to estimate uncertainty
@@ -285,7 +295,7 @@ def visualize_results(model, noisy_data, clean_data, num_samples=100):
     fig, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
     for i in range(3):
         axs[i].plot(noisy_data[i].numpy(), label='Noisy Input')
-        axs[i].plot(clean_data[i].numpy(), label='Clean Input')
+        # axs[i].plot(clean_data[i].numpy(), label='Clean Input')
         axs[i].plot(mean_outputs[i].numpy(), label='Mean Denoised Output', linestyle='dashed')
         axs[i].plot(lower[i].numpy(), label='Mean - 2*Std (≈2.5%)', linestyle='dotted', color='red')
         axs[i].plot(upper[i].numpy(), label='Mean + 2*Std (≈97.5%)', linestyle='dotted', color='green')
@@ -296,4 +306,4 @@ def visualize_results(model, noisy_data, clean_data, num_samples=100):
     plt.show()
 
 # Visualize on test data
-visualize_results(modelLSTMVAE, test_noisy, test_clean)
+visualize_results(model, test_noisy)

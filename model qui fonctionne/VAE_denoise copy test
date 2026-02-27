@@ -1,0 +1,219 @@
+import torch
+import torch.nn as nn
+import torch.nn.init as init
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+import torch.nn.functional as F
+import pandas as pd
+
+# Set random seeds for reproducibility
+torch.manual_seed(50)
+np.random.seed(50)
+
+"""# Step 1: Generate Complex Synthetic Dataset
+def generate_complex_sequence(length=50, num_sequences=1000, noise_factor=0.5):
+    x = np.linspace(0, 4 * np.pi, length)
+
+    # Create complex clean signal by combining sinusoids of different frequencies
+    clean_sequences = np.array([
+        np.sin(x + np.random.uniform(0, 2 * np.pi)) +
+        0.5 * np.sin(2 * x + np.random.uniform(0, 2 * np.pi)) +
+        0.25 * np.sin(4 * x + np.random.uniform(0, 2 * np.pi))
+        for _ in range(num_sequences)
+    ])
+
+    # Add complex noise: Gaussian noise + occasional spikes + uniform noise
+    gaussian_noise = noise_factor * np.random.normal(size=clean_sequences.shape)
+    spike_noise = np.random.choice([0, 1], size=clean_sequences.shape, p=[0.98, 0.02]) * np.random.uniform(-3, 3, size=clean_sequences.shape)
+    uniform_noise = noise_factor * np.random.uniform(-1, 1, size=clean_sequences.shape)
+
+    noisy_sequences = clean_sequences + gaussian_noise + spike_noise + uniform_noise
+    return torch.tensor(noisy_sequences, dtype=torch.float32), torch.tensor(clean_sequences, dtype=torch.float32)"""
+
+# Generate data
+#noisy_data, clean_data = generate_complex_sequence()
+#train_noisy, test_noisy, train_clean, test_clean = train_test_split(noisy_data, clean_data, test_size=0.2)
+
+df1 = pd.read_csv('test_stat974.csv')
+df2 = pd.read_csv("test_stat393.csv")
+Vstack1_value = df1['Vstack_value'].values
+Vstack2_value = df2['Vstack_value'].values
+Istack1_value = df1['Istack_value'].values
+Istack2_value = df2['Istack_value'].values
+
+# combine the data and convert to tensor
+Vstack_value = np.vstack((Vstack1_value, Vstack2_value))
+Istack_value = np.vstack((Istack1_value, Istack2_value))
+Vstack_value = torch.tensor(Vstack_value, dtype=torch.float32)
+Istack_value = torch.tensor(Istack_value, dtype=torch.float32)
+
+# separate the real data in train and test
+#train_vstack, test_vstack, train_istack, test_istack = train_test_split(Vstack_value, Istack_value, test_size=0.0)
+train_vstack, test_vstack = Vstack_value, Vstack_value
+
+# the lines above are just to create the noisy data so dont need to touch it 
+
+# Step 2: Define the LSTM-based Variational Autoencoder (VAE) model
+# the encoder uses an LSTM to produce a hidden state which is mapped to
+# mean and log-variance vectors.  The decoder is another LSTM that is
+# initialized from the latent variable and generates a reconstruction.
+class LSTMVAE(nn.Module):
+    def __init__(self, seq_len, n_features, hidden_dim, latent_dim, num_layers=1):
+        super(LSTMVAE, self).__init__()
+        self.seq_len = seq_len
+        self.n_features = n_features
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        self.num_layers = num_layers
+        self.log_logma = torch.zeros([])
+
+        # encoder
+        self.encoder_lstm = nn.LSTM(
+            input_size=n_features,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+        )
+        self.hidden2mu = nn.Linear(hidden_dim, latent_dim)
+        self.hidden2logvar = nn.Linear(hidden_dim, latent_dim)
+
+        # decoder
+        self.latent2hidden = nn.Linear(latent_dim, hidden_dim)
+        self.decoder_lstm = nn.LSTM(
+            input_size=n_features,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+        )
+        self.outputs2features = nn.Linear(hidden_dim, n_features)
+
+    def encode(self, x):
+        _, (h_n, _) = self.encoder_lstm(x)
+        h = h_n[-1]  # last layer's hidden state
+        mu = self.hidden2mu(h)
+        logvar = self.hidden2logvar(h)
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z):
+        # check this
+        # initialize hidden and cell states from latent vector
+        h0 = self.latent2hidden(z).unsqueeze(0).repeat(self.num_layers, 1, 1)
+        c0 = torch.zeros_like(h0)
+        # feed zero input sequence to the decoder
+        dec_input = torch.zeros(z.size(0), self.seq_len, self.n_features, device=z.device)
+        dec_output, _ = self.decoder_lstm(dec_input, (h0, c0))
+        out = self.outputs2features(dec_output)
+        return out
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        recon = self.decode(z)
+
+        # calc loss
+        loss, recon_loss, kld_loss = self.loss_fct(recon, x, mu, logvar)
+        return recon, loss, recon_loss, kld_loss, mu, logvar
+    
+    def gaussian_nnl(self, mu, log_sigma, input): 
+        return 0.5*torch.pow((input-mu) / log_sigma.exp(), 2) + log_sigma+ 0.5 * torch.tensor(2*np.pi).log()
+    
+    def softclip(self, input, min):
+        """ Clips the tensor values at the minimum value min in a softway. Taken from Handful of Trials """
+        result_tensor = min + F.softplus(input - min)
+        return result_tensor
+    
+    def loss_fct(self, *args):
+        recon_loss = args[0]
+        input = args[1]
+        mu = args[2]
+        logvar = args[3]
+
+        # recon loss part
+        self.log_sigma = ((input - recon_loss) ** 2).mean().sqrt().log() 
+        log_sigma = self.softclip(self.log_sigma, -6)
+        recons_loss = self.gaussian_nnl(recon_loss, log_sigma, input).sum()
+
+        # kld loss part
+        kld_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+
+        # total loss
+        loss = recons_loss + kld_loss
+
+        return loss, recons_loss, kld_loss
+
+# Model, loss function, and optimizer
+# reshape data for LSTM (batch, seq_len, features)
+train_vstack = train_vstack.unsqueeze(-1)
+test_vstack = test_vstack.unsqueeze(-1)
+
+seq_len = train_vstack.size(1)
+n_features = 1
+hidden_dim = 64
+latent_dim = 2
+model = LSTMVAE(seq_len, n_features, hidden_dim, latent_dim)
+# criterion = nn.MSELoss(reduction='mean')
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+# training hyperparameters
+num_epochs = 500
+batch_size = 32
+
+# save the values of loss, recon loss and kls loss for a graph later
+loss_tot = []
+recon_tot = []
+kld_tot = []
+
+# Step 3: Train the LSTM VAE
+for epoch in range(num_epochs):
+    total_loss = 0
+    num_batches = 0
+    for i in range(0, len(train_vstack), batch_size):
+        batch_vstack = train_vstack[i:i+batch_size]
+        #batch_clean = train_clean[i:i+batch_size]
+
+        recon, loss, recon_loss, kld_loss, mu, logvar = model(batch_vstack)
+        loss_tot.append(loss.item())
+        recon_tot.append(recon_loss.item())
+        kld_tot.append(kld_loss.item())
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        num_batches += 1
+
+    if (epoch+1) % 10 == 0:
+        avg_loss = total_loss / num_batches
+        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}')
+
+# Step 4: Visualize Results
+def visualize_results(model, noisy_data):
+    model.eval()
+    with torch.no_grad():
+        recon, loss, recon_loss, kld_loss, mu, logvar = model(noisy_data)
+
+    # squeeze feature dimension for plotting
+    noisy = noisy_data.squeeze(-1).cpu().numpy()
+    #clean = clean_data.squeeze(-1).cpu().numpy()
+    pred = recon.squeeze(-1).cpu().numpy()
+
+    fig, axs = plt.subplots(1, 1, figsize=(10, 8))
+    axs.plot(noisy[0], label='Abnormal noisy Input')
+    #axs.plot(clean[1], label='Clean Sequence')
+    axs.plot(pred[0], label='Reconstructed', linestyle='dashed')
+    axs.legend()
+    axs.set_title(f'Sequence Reconstruction')
+
+    plt.xlabel('Time Step2')
+    plt.show()
+
+# Visualize on test data
+visualize_results(model, test_vstack)
+     

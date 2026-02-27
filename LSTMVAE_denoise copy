@@ -25,10 +25,10 @@ def generate_complex_sequence(length=50, num_sequences=1000, noise_factor=0.5):
 
     # Add complex noise: Gaussian noise + occasional spikes + uniform noise
     gaussian_noise = noise_factor * np.random.normal(size=clean_sequences.shape)
-    spike_noise = np.random.choice([0, 1], size=clean_sequences.shape, p=[0.98, 0.02]) * np.random.uniform(-3, 3, size=clean_sequences.shape)
-    uniform_noise = noise_factor * np.random.uniform(-1, 1, size=clean_sequences.shape)
+    # spike_noise = np.random.choice([0, 1], size=clean_sequences.shape, p=[0.98, 0.02]) * np.random.uniform(-3, 3, size=clean_sequences.shape)
+    # uniform_noise = noise_factor * np.random.uniform(-1, 1, size=clean_sequences.shape)
 
-    noisy_sequences = clean_sequences + gaussian_noise + spike_noise + uniform_noise
+    noisy_sequences = clean_sequences + gaussian_noise # + spike_noise + uniform_noise
     return torch.tensor(noisy_sequences, dtype=torch.float32), torch.tensor(clean_sequences, dtype=torch.float32)
 
 # Generate data
@@ -92,6 +92,7 @@ class decoder(nn.Module):
         self.num_layers = num_layers
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, bidirectional=False)
         self.fc = nn.Linear(hidden_size, output_size)
+        self.log_sigma = torch.zeros([])
 
     def forward(self, x, hidden): 
         """
@@ -151,15 +152,15 @@ class LSTMVAE(nn.Module):
         return mu + eps * std
 
     def forward(self,x):
-        batch_size, seq_len, feature_dim = x.shape
+        #batch_size, seq_len, feature_dim = x.shape
 
         # encoder le input
         enc_hidden, enc_cell = self.lstm_enc(x)
-        enc_h = enc_hidden[0].view(batch_size, self.hidden_size).to(self.device)
+        #enc_h = enc_hidden[0].view(batch_size, self.hidden_size).to(self.device)
 
         # calc mu et logvar
-        mu = self.fc21(enc_h)
-        logvar = self.fc22(enc_h)
+        mu = self.fc21(enc_hidden[-1])  # Use last layer's hidden state
+        logvar = self.fc22(enc_hidden[-1])
         z = self.reparameterize(mu, logvar)
 
         # init le hidden state avec inputs
@@ -167,28 +168,34 @@ class LSTMVAE(nn.Module):
         c_ = torch.zeros_like(h_)  # Initialize cell state
 
         # decode le latent space
-        z = z.repeat(1, seq_len, 1)
-        z = z.view(batch_size, seq_len, self.latent_size).to(self.device)
+        z = z.repeat(1, 50, 1)
+        z = z.view(32, 50, self.latent_size).to(self.device)
 
         # init le hidden state
         hidden = (h_.unsqueeze(0).contiguous(), c_.unsqueeze(0).contiguous())
-        recon_output, hidden = self.lstm_dec(z, hidden)
-
-        x_hat = recon_output
+        recon, hidden = self.lstm_dec(z, hidden)
 
         # calc le loss
-        loss = self.loss_fct(x_hat, x, mu, logvar)
+        loss = self.loss_fct(recon, x, mu, logvar)
         m_loss, recon_loss, kld_loss = (
             loss["loss"], 
             loss["recon_loss"],
             loss["KLD"]
         )
 
-        return m_loss, x_hat, (recon_loss, kld_loss)
+        return m_loss, recon, recon_loss, kld_loss, mu, logvar
 
 
+    def gaussian_nnl(self, mu, log_sigma, x):
+        return 0.5*torch.pow((x-mu) / log_sigma.exp(), 2) + log_sigma+ 0.5 * torch.tensor(2*np.pi).log()
+
+    def softclip(self, tensor, min):
+        """ Clips the tensor values at the minimum value min in a softway. Taken from Handful of Trials """
+        result_tensor = min + F.softplus(tensor - min)
+        return result_tensor
+        
     # determine the VAE loss (dif from normal MSE)
-    def loss_fct(self, *args, **kwargs) -> dict:
+    def loss_fct(self, *args) -> dict:
         """
         calc le lorss VAE
         """
@@ -197,14 +204,17 @@ class LSTMVAE(nn.Module):
         mu = args[2]
         logvar = args[3]
 
-        kld_weight = 0.01
-        recons_loss = F.mse_loss(recons, input)
+        # reconstruction loss part
+        self.log_sigma = ((input - recons) ** 2).mean().sqrt().log() 
+        log_sigma = self.softclip(self.log_sigma, -6)
+        recons_loss = self.gaussian_nnl(recons, log_sigma, input).sum()
 
-        # add the kl divergence which makes it diff from the loss in a normal ae
-        kld_loss = torch.mean(-0.5 * torch.sum(1 + logvar - mu**2 - logvar.exp(), dim=1), dim=0)
+        # kld loss part
+        kld_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
-        # calculate the loss
-        loss = recons_loss + kld_weight*kld_loss
+        # total loss
+        loss = recons_loss + kld_loss 
+
         return {'loss': loss, "recon_loss": recons_loss.detach(), "KLD": kld_loss.detach()}
 
 # question: what would be seq len and other stuff for our data!!!!!
@@ -217,12 +227,17 @@ model = LSTMVAE(input_size, hidden_size, latent_dim, device=device).to(device) #
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 # Step 3: Train the Autoencoder
-num_epochs = 1000
+num_epochs = 500
 batch_size = 32
 train_noisy_gpu = train_noisy.unsqueeze(2).to(device)  # Pre-move data to device
 train_clean_gpu = train_clean.unsqueeze(2).to(device)
 
-model.train()  # Set to training mode
+# save the values of loss, recon loss and kls loss for a graph later
+loss_tot = []
+recon_tot = []
+kld_tot = []
+
+#model.train()  # Set to training mode
 for epoch in range(num_epochs):
     total_loss = 0
     num_batches = 0
@@ -231,14 +246,17 @@ for epoch in range(num_epochs):
         batch_clean = train_clean_gpu[i:i+batch_size]
 
         # Forward pass
-        loss, x_hat, (recon_loss, kld_loss) = model(batch_noisy)
+        m_loss, recon, recon_loss, kld_loss, mu, logvar = model(batch_noisy)
+        loss_tot.append(m_loss.item())
+        recon_tot.append(recon_loss.item())
+        kld_tot.append(kld_loss.item())
 
         # Backward and optimize
         optimizer.zero_grad()
-        loss.backward()
+        m_loss.backward()
         optimizer.step()
         
-        total_loss += loss.item()
+        total_loss += m_loss.item()
         num_batches += 1
 
     if (epoch+1) % 10 == 0:
@@ -250,32 +268,13 @@ def visualize_results(model, noisy_data, clean_data, device, num_samples=100, ba
     """Efficiently generate multiple samples by batch processing latent codes."""
     model.eval()
     with torch.no_grad():
+        recon, loss, recon_loss, kld_loss, mu, logvar = model(noisy_data)
         noisy_test = noisy_data[:3].unsqueeze(2).to(device)  # Shape: (3, seq_len, 1)
         batch_size_test, seq_len, feature_dim = noisy_test.shape
         
-        # Encode once to get mu and logvar
-        enc_hidden, enc_cell = model.lstm_enc(noisy_test)
-        enc_h = enc_hidden[0].view(batch_size_test, model.hidden_size).to(device)
-        mu = model.fc21(enc_h)
-        logvar = model.fc22(enc_h)
-        
-        # Sample multiple latent codes efficiently
-        samples = []
-        for _ in range(num_samples):
-            z = model.reparameterize(mu, logvar)
-            h_ = model.fc3(z)
-            c_ = torch.zeros_like(h_)
-            z_expanded = z.unsqueeze(1).expand(-1, seq_len, -1)
-            
-            hidden = (h_.unsqueeze(0).contiguous(), c_.unsqueeze(0).contiguous())
-            recon_output, _ = model.lstm_dec(z_expanded, hidden)
-            samples.append(recon_output)
-        
-        samples = torch.stack(samples).squeeze(-1)  # Shape: (num_samples, batch_size, seq_len)
-        
         # Compute statistics across samples
-        mean_outputs = samples.mean(dim=0)
-        std_outputs = samples.std(dim=0)
+        mean_outputs = recon.mean(dim=0)
+        std_outputs = recon.std(dim=0)
         lower = mean_outputs - 2 * std_outputs
         upper = mean_outputs + 2 * std_outputs
 

@@ -126,7 +126,7 @@ model = DenoisingVAE(input_size, hidden_size, latent_dim)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 # Step 3: Train the Autoencoder
-num_epochs = 1000
+num_epochs = 100
 batch_size = 32
 
 for epoch in range(num_epochs):

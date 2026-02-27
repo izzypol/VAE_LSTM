@@ -26,7 +26,8 @@ Vstack_value = torch.tensor(Vstack_value, dtype=torch.float32)
 Istack_value = torch.tensor(Istack_value, dtype=torch.float32)
 
 # separate the real data in train and test
-train_vstack, test_vstack, train_istack, test_istack = train_test_split(Vstack_value, Istack_value, test_size=0.2)
+#train_vstack, test_vstack, train_istack, test_istack = train_test_split(Vstack_value, Istack_value, test_size=0.0)
+train_vstack, test_vstack = Vstack_value, Vstack_value
 
 class encoder(nn.Module):
     """
@@ -270,19 +271,11 @@ for epoch in range(num_epochs):
         print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}')
 
 # Step 4: Visualize Results
-def visualize_results(model, vstack_data, device, num_samples=100, batch_size=10):
+def visualize_results(model, noisy_data, device, num_samples=100, batch_size=10):
     model.eval()
     with torch.no_grad():
-        # Ensure vstack_data is a Torch tensor with shape (B, S, F)
-        if not isinstance(vstack_data, torch.Tensor):
-            vstack_data = torch.tensor(vstack_data, dtype=torch.float32)
-        if vstack_data.dim() == 1:
-            vstack_data = vstack_data
-        elif vstack_data.dim() == 2:
-            vstack_data = vstack_data
-        vstack_data = vstack_data.to(device)
 
-        noisy_test = vstack_data[:3]  # Shape: (3, seq_len, feature_dim)
+        noisy_test = noisy_data[:3]  # Shape: (3, seq_len, feature_dim)
         batch_size_test, seq_len, feature_dim = noisy_test.shape
 
         # Encode once to get mu and logvar

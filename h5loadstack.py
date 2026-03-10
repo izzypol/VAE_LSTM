@@ -48,9 +48,9 @@ Vstack_value = Vstack_value[:, sortIdx]
 Istack_value = Istack_value[:, sortIdx]
 
 # Plot station 1000 (Python index 999 if matching MATLAB 1000)
-k = 392  # MATLAB 1000 → Python 999
+k = len(stationIDs_sorted) - 1  # MATLAB 1000 → Python 999
 
-plt.figure(1)
+"""plt.figure(1)
 plt.clf()
 plt.plot(Vstack_value[:,k])
 plt.title(f'Vstack - Station {k} (ID: {int(stationIDs_sorted[k])})')
@@ -58,7 +58,9 @@ plt.xlabel('Sample')
 plt.ylabel('Value')
 plt.pause(0.5)
 
-plt.show()
+plt.show()"""
 
-df = pd.DataFrame([Vstack_value[:, k][430:500], Istack_value[:, k][430:500]]).transpose()
-df.to_csv("test_stat393.csv", index=False, header=['Vstack_value', 'Istack_value'])
+
+names = np.arange(0,nStations)
+df = pd.DataFrame(Vstack_value[430:500])
+df.to_csv("test_L44E.csv", index=False, header=names)

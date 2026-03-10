@@ -8,60 +8,17 @@ import torch.nn.functional as F
 import pandas as pd
 from matplotlib.font_manager import FontProperties
 
-# Set random seeds for reproducibility
-torch.manual_seed(50)
-np.random.seed(50)
+# extract the data (all 2768 stations)
+df1 = pd.read_csv('test_L44E.csv').values
+Vstack_value = torch.tensor(df1, dtype=torch.float32)
 
-"""# Step 1: Generate Complex Synthetic Dataset
-def generate_complex_sequence(length=50, num_sequences=1000, noise_factor=0.5):
-    x = np.linspace(0, 4 * np.pi, length)
-
-    # Create complex clean signal by combining sinusoids of different frequencies
-    clean_sequences = np.array([
-        np.sin(x + np.random.uniform(0, 2 * np.pi)) +
-        0.5 * np.sin(2 * x + np.random.uniform(0, 2 * np.pi)) +
-        0.25 * np.sin(4 * x + np.random.uniform(0, 2 * np.pi))
-        for _ in range(num_sequences)
-    ])
-
-    # Add complex noise: Gaussian noise + occasional spikes + uniform noise
-    gaussian_noise = noise_factor * np.random.normal(size=clean_sequences.shape)
-    spike_noise = np.random.choice([0, 1], size=clean_sequences.shape, p=[0.98, 0.02]) * np.random.uniform(-3, 3, size=clean_sequences.shape)
-    uniform_noise = noise_factor * np.random.uniform(-1, 1, size=clean_sequences.shape)
-
-    noisy_sequences = clean_sequences + gaussian_noise + spike_noise + uniform_noise
-    return torch.tensor(noisy_sequences, dtype=torch.float32), torch.tensor(clean_sequences, dtype=torch.float32)"""
-
-# Generate data
-#noisy_data, clean_data = generate_complex_sequence()
-#train_noisy, test_noisy, train_clean, test_clean = train_test_split(noisy_data, clean_data, test_size=0.2)
-
-df1 = pd.read_csv('test_stat974.csv')
-df2 = pd.read_csv("test_stat393.csv")
-Vstack1_value = df1['Vstack_value'].values
-Vstack2_value = df2['Vstack_value'].values
-Istack1_value = df1['Istack_value'].values
-Istack2_value = df2['Istack_value'].values
-
-# add a spike 
-Vstack2_value[40] += 0.5
-
-# combine the data and convert to tensor
-Vstack_value = np.vstack((Vstack1_value, Vstack2_value))
-Istack_value = np.vstack((Istack1_value, Istack2_value))
-Vstack_value = torch.tensor(Vstack_value, dtype=torch.float32)
-Istack_value = torch.tensor(Istack_value, dtype=torch.float32)
+# add a spike (used later)
+# Vstack2_value[40] += 0.5
 
 # separate the real data in train and test
-#train_vstack, test_vstack, train_istack, test_istack = train_test_split(Vstack_value, Istack_value, test_size=0.0)
-train_vstack, test_vstack = Vstack_value, Vstack_value
+train_vstack, test_vstack= train_test_split(Vstack_value, test_size=0.8)
 
-# the lines above are just to create the noisy data so dont need to touch it 
-
-# Step 2: Define the LSTM-based Variational Autoencoder (VAE) model
-# the encoder uses an LSTM to produce a hidden state which is mapped to
-# mean and log-variance vectors.  The decoder is another LSTM that is
-# initialized from the latent variable and generates a reconstruction.
+# Define the LSTM-based Variational Autoencoder (VAE) model
 class LSTMVAE(nn.Module):
     def __init__(self, seq_len, n_features, hidden_dim, latent_dim, num_layers=1):
         super(LSTMVAE, self).__init__()
@@ -128,7 +85,6 @@ class LSTMVAE(nn.Module):
         return 0.5*torch.pow((input-mu) / log_sigma.exp(), 2) + log_sigma+ 0.5 * torch.tensor(2*np.pi).log()
     
     def softclip(self, input, min):
-        """ Clips the tensor values at the minimum value min in a softway. Taken from Handful of Trials """
         result_tensor = min + F.softplus(input - min)
         return result_tensor
     
@@ -161,7 +117,6 @@ n_features = 1
 hidden_dim = 64
 latent_dim = 2
 model = LSTMVAE(seq_len, n_features, hidden_dim, latent_dim)
-# criterion = nn.MSELoss(reduction='mean')
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 # training hyperparameters
@@ -179,7 +134,6 @@ for epoch in range(num_epochs):
     num_batches = 0
     for i in range(0, len(train_vstack), batch_size):
         batch_vstack = train_vstack[i:i+batch_size]
-        #batch_clean = train_clean[i:i+batch_size]
 
         recon, loss, recon_loss, kld_loss, mu, logvar = model(batch_vstack)
         loss_tot.append(loss.item())
@@ -205,15 +159,13 @@ def visualize_results(model, noisy_data):
 
     # squeeze feature dimension for plotting
     noisy = noisy_data.squeeze(-1).cpu().numpy()
-    #clean = clean_data.squeeze(-1).cpu().numpy()
     pred = recon.squeeze(-1).cpu().numpy()
 
     # set the font
     font = FontProperties(family="Times new roman")
 
     fig, axs = plt.subplots(1, 1, figsize=(4, 4))
-    axs.plot(noisy[1], label='Noisy Input')   
-    #axs.plot(clean[1], label='Clean Sequence')
+    axs.plot(noisy[1], label='Noisy Input')
     axs.plot(pred[1], label='Reconstructed', linestyle='dashed')
     axs.legend()
     plt.ylabel('Potential (mV)')

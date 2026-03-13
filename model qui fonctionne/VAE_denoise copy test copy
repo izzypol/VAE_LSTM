@@ -9,7 +9,7 @@ import pandas as pd
 from matplotlib.font_manager import FontProperties
 
 # extract the data (all 2768 stations)
-df1 = pd.read_csv('test_L44E.csv').values
+df1 = pd.read_csv('test_L44E.csv').transpose().values
 Vstack_value = torch.tensor(df1, dtype=torch.float32)
 
 # add a spike (used later)
@@ -17,6 +17,8 @@ Vstack_value = torch.tensor(df1, dtype=torch.float32)
 
 # separate the real data in train and test
 train_vstack, test_vstack= train_test_split(Vstack_value, test_size=0.8)
+train_size = train_vstack.size(0)
+test_size = test_vstack.size(0)
 
 # Define the LSTM-based Variational Autoencoder (VAE) model
 class LSTMVAE(nn.Module):
@@ -164,14 +166,18 @@ def visualize_results(model, noisy_data):
     # set the font
     font = FontProperties(family="Times new roman")
 
+    number = np.random.randint(0, noisy.shape[0])
+    print(number)
     fig, axs = plt.subplots(1, 1, figsize=(4, 4))
-    axs.plot(noisy[1], label='Noisy Input')
-    axs.plot(pred[1], label='Reconstructed', linestyle='dashed')
+    axs.plot(noisy[number], label='Noisy Input')
+    axs.plot(pred[number], label='Reconstructed', linestyle='dashed')
     axs.legend()
     plt.ylabel('Potential (mV)')
     plt.xlabel('Sample index')
     plt.show()
 
+
+    # utiliser les tot et ce n'Est pas pour une seul courbe
     fig2, axs2 = plt.subplots(1, 1, figsize=(4, 4))
     axs2.plot(loss_tot, label='Total loss', alpha=0.7)
     axs2.plot(recon_tot, label='Recontruction loss', alpha=0.7)
@@ -179,7 +185,7 @@ def visualize_results(model, noisy_data):
     axs2.legend(fontsize=8)
     plt.ylabel('Loss value')
     plt.xlabel('Optimization step')
-    plt.tight_layout()
+    plt.tight_layout() 
     plt.show()
 
 # Visualize on test data

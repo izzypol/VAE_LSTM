@@ -48,7 +48,13 @@ Vstack_value = Vstack_value[:, sortIdx]
 Istack_value = Istack_value[:, sortIdx]
 
 # Plot station 1000 (Python index 999 if matching MATLAB 1000)
-k = len(stationIDs_sorted) - 1  # MATLAB 1000 → Python 999
+#k = len(stationIDs_sorted) - 1  # MATLAB 1000 → Python 999
+
+# verify if the curve is generally decreasing 
+# do this by splitting the curve into 10 segments and checking if the mean of each segment is decreasing
+#Vstack_value_neg = []
+#for i in Vstack_value: 
+#    i = np.array_split(i, 10)
 
 """plt.figure(1)
 plt.clf()
@@ -62,5 +68,5 @@ plt.show()"""
 
 
 names = np.arange(0,nStations)
-df = pd.DataFrame(Vstack_value[430:500])
+df = pd.DataFrame(Vstack_value)
 df.to_csv("test_L44E.csv", index=False, header=names)

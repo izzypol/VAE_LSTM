@@ -4,21 +4,52 @@ import torch.nn.init as init
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
+from skimage.util.shape import view_as_windows
 import torch.nn.functional as F
 import pandas as pd
 from matplotlib.font_manager import FontProperties
 
-# extract the data (all 2768 stations)
-df1 = pd.read_csv('test_L44E.csv').transpose().values
-Vstack_value = torch.tensor(df1, dtype=torch.float32)
+
+"""X = torch.empty((1501,1600), dtype=torch.float32)
+X[:] = np.nan
+test = torch.tensor(np.random.rand(100), dtype=torch.float32)
+starting_places = 0
+stoping_places = 100
+for i in X:
+    print(starting_places, stoping_places)
+    if starting_places <= 1501: 
+        i[starting_places:stoping_places] = test
+        starting_places += 10
+        stoping_places += 10
+    else: 
+        continue"""
+    
+
+
+
+# extract the data 
+df1 = pd.read_csv('test_L44E.csv').transpose().values[:1]
+#Vstack_value = torch.tensor(df1, dtype=torch.float32)
 
 # add a spike (used later)
 # Vstack2_value[40] += 0.5
 
 # separate the real data in train and test
-train_vstack, test_vstack= train_test_split(Vstack_value, test_size=0.8)
-train_size = train_vstack.size(0)
-test_size = test_vstack.size(0)
+#train_vstack, test_vstack= train_test_split(df1, test_size=0.8)
+train_vstack, test_vstack = df1, df1
+train_size = len(train_vstack)
+test_size = len(test_vstack)
+
+# determine the size of the sliding window
+lookback = 100
+
+# create a new tensor that uses the size of the sliding window and has the windows overlapping
+train_vstack = view_as_windows(train_vstack, (1, lookback), step=(1,1)).reshape(-1, lookback)
+test_vstack = view_as_windows(test_vstack, (1, lookback), step=(1,1)).reshape(-1, lookback)
+
+# convert to PyTorch tensors
+train_vstack = torch.tensor(train_vstack).float()
+test_vstack = torch.tensor(test_vstack).float()
 
 # Define the LSTM-based Variational Autoencoder (VAE) model
 class LSTMVAE(nn.Module):
@@ -122,7 +153,7 @@ model = LSTMVAE(seq_len, n_features, hidden_dim, latent_dim)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 # training hyperparameters
-num_epochs = 1000
+num_epochs = 100
 batch_size = 32
 
 # save the values of loss, recon loss and kls loss for a graph later

@@ -32,7 +32,7 @@ def prep_data(file_name):
     test_size = len(test_vstack)
 
     # size of the sliding window
-    lookback = 100 
+    lookback = 1600 
 
     # create a new tensor that uses the size of the sliding window
     # and has overlapping windows 
@@ -223,7 +223,7 @@ def visualize_results(model, file_name):
         reconstructed, _, _, _, _, _ = model(test_vstack.unsqueeze(-1))
         for i, j in zip(pred, reconstructed):
             if starting_places <= 1500: 
-                i[starting_places:stoping_places] = j.squeeze(-1)
+                i[starting_places:stoping_places] = j.squeeze(-1) # add other dimension pour toutes les courbes 
                 starting_places += 1
                 stoping_places += 1
             else: 

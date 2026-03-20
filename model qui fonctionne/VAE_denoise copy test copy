@@ -9,47 +9,41 @@ import torch.nn.functional as F
 import pandas as pd
 from matplotlib.font_manager import FontProperties
 
+def prep_data(file_name):
 
-"""X = torch.empty((1501,1600), dtype=torch.float32)
-X[:] = np.nan
-test = torch.tensor(np.random.rand(100), dtype=torch.float32)
-starting_places = 0
-stoping_places = 100
-for i in X:
-    print(starting_places, stoping_places)
-    if starting_places <= 1501: 
-        i[starting_places:stoping_places] = test
-        starting_places += 10
-        stoping_places += 10
-    else: 
-        continue"""
-    
+    """ function that prepares the data in a format that is compatible with the model
 
+    Arguments: 
+    - file_name: name of the csv containing the full waveform data
 
+    Returns: 
+    - train_vstack: tensor containing the training data 
+    - test_vstack: tensor containing the test data 
+    """
+    # extract data 
+    df = pd.read_csv(file_name).transpose().values[:1] # change the number later
 
-# extract the data 
-df1 = pd.read_csv('test_L44E.csv').transpose().values[:1]
-#Vstack_value = torch.tensor(df1, dtype=torch.float32)
+    # add spike later for testing 
 
-# add a spike (used later)
-# Vstack2_value[40] += 0.5
+    # separate into train and test datasets 
+    # train__vstack, test_vstack = train_test_split(df, test_size=0.8)
+    train__vstack, test_vstack = df, df
+    train_size = len(train__vstack)
+    test_size = len(test_vstack)
 
-# separate the real data in train and test
-#train_vstack, test_vstack= train_test_split(df1, test_size=0.8)
-train_vstack, test_vstack = df1, df1
-train_size = len(train_vstack)
-test_size = len(test_vstack)
+    # size of the sliding window
+    lookback = 100 
 
-# determine the size of the sliding window
-lookback = 100
+    # create a new tensor that uses the size of the sliding window
+    # and has overlapping windows 
+    train_vstack = view_as_windows(train__vstack, (1, lookback), step=(1,1)).reshape(-1, lookback)
+    test_vstack = view_as_windows(test_vstack, (1, lookback), step=(1,1)).reshape(-1, lookback)
 
-# create a new tensor that uses the size of the sliding window and has the windows overlapping
-train_vstack = view_as_windows(train_vstack, (1, lookback), step=(1,1)).reshape(-1, lookback)
-test_vstack = view_as_windows(test_vstack, (1, lookback), step=(1,1)).reshape(-1, lookback)
+    # convert to pytorch tensor
+    train_vstack = torch.tensor(train_vstack).float()
+    test_vstack = torch.tensor(test_vstack).float()
 
-# convert to PyTorch tensors
-train_vstack = torch.tensor(train_vstack).float()
-test_vstack = torch.tensor(test_vstack).float()
+    return train_vstack, test_vstack
 
 # Define the LSTM-based Variational Autoencoder (VAE) model
 class LSTMVAE(nn.Module):
@@ -142,18 +136,20 @@ class LSTMVAE(nn.Module):
 
 # Model, loss function, and optimizer
 # reshape data for LSTM (batch, seq_len, features)
-train_vstack = train_vstack.unsqueeze(-1)
-test_vstack = test_vstack.unsqueeze(-1)
+
+train_data, test_data = prep_data('test_L44E.csv')
+train_vstack = train_data.unsqueeze(-1)
+test_vstack = test_data.unsqueeze(-1)
 
 seq_len = train_vstack.size(1)
 n_features = 1
-hidden_dim = 64
-latent_dim = 2
+hidden_dim = 64 # do we make this 100 to correspond to the lookback 
+latent_dim = 2 # faire varier pcq ca peut faire stagner le model
 model = LSTMVAE(seq_len, n_features, hidden_dim, latent_dim)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 # training hyperparameters
-num_epochs = 100
+num_epochs = 500
 batch_size = 32
 
 # save the values of loss, recon loss and kls loss for a graph later
@@ -170,7 +166,7 @@ for epoch in range(num_epochs):
 
         recon, loss, recon_loss, kld_loss, mu, logvar = model(batch_vstack)
         loss_tot.append(loss.item())
-        recon_tot.append(recon_loss.item())
+        recon_tot.append(recon_loss.item()) # append le loss moyen au lieu du loss brute comme ici
         kld_tot.append(kld_loss.item())
 
         optimizer.zero_grad()
@@ -185,23 +181,64 @@ for epoch in range(num_epochs):
         print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}')
 
 # Step 4: Visualize Results
-def visualize_results(model, noisy_data):
-    model.eval()
-    with torch.no_grad():
-        recon, loss, recon_loss, kld_loss, mu, logvar = model(noisy_data)
+def visualize_results(model, file_name):
+    """Function that evaluates the model suing the test dataset and visualises the results 
+       and the evolution of the loss values 
 
-    # squeeze feature dimension for plotting
-    noisy = noisy_data.squeeze(-1).cpu().numpy()
-    pred = recon.squeeze(-1).cpu().numpy()
+    Arguments: 
+    - model: the trained LSTM VAE model
+    - file_name: the name of the csv containing the full waveform data
+
+    returns:
+    - graph 1: comparisson between raw and denoised curves 
+    - curve 2: evolution of the loss values during training
+    """
+
+    # extract the data 
+    _, test_vstack = prep_data(file_name)
+
+    # combine the curves for the raw data
+    noisy = torch.empty((1501,1600), dtype=torch.float32)
+    noisy[:] = np.nan
+    starting_places1 = 0
+    stoping_places1 = 100
+    row = 0
+    for l in noisy:
+        if starting_places1 <= 1500: 
+            l[starting_places1:stoping_places1] = test_vstack[row]
+            starting_places1 += 1
+            stoping_places1 += 1
+            row += 1
+        else: 
+            continue
+    noisy = noisy.nanmean(0)
+    
+    model.eval()
+    # evaluate and combine the curves for the denoised data
+    with torch.no_grad():
+        pred = torch.empty((1501,1600), dtype=torch.float32)
+        pred[:] = np.nan
+        starting_places = 0
+        stoping_places = 100
+        reconstructed, _, _, _, _, _ = model(test_vstack.unsqueeze(-1))
+        for i, j in zip(pred, reconstructed):
+            if starting_places <= 1500: 
+                i[starting_places:stoping_places] = j.squeeze(-1)
+                starting_places += 1
+                stoping_places += 1
+            else: 
+                continue
+        print(pred)
+        pred = pred.nanmean(0)
+        print(pred)
 
     # set the font
     font = FontProperties(family="Times new roman")
-
-    number = np.random.randint(0, noisy.shape[0])
-    print(number)
+    
+    # graph comparing the raw and denoised curves
     fig, axs = plt.subplots(1, 1, figsize=(4, 4))
-    axs.plot(noisy[number], label='Noisy Input')
-    axs.plot(pred[number], label='Reconstructed', linestyle='dashed')
+    axs.plot(noisy, label='Noisy Input')
+    axs.plot(pred, label='Reconstructed', linestyle='dashed')
     axs.legend()
     plt.ylabel('Potential (mV)')
     plt.xlabel('Sample index')
@@ -211,7 +248,7 @@ def visualize_results(model, noisy_data):
     # utiliser les tot et ce n'Est pas pour une seul courbe
     fig2, axs2 = plt.subplots(1, 1, figsize=(4, 4))
     axs2.plot(loss_tot, label='Total loss', alpha=0.7)
-    axs2.plot(recon_tot, label='Recontruction loss', alpha=0.7)
+    #axs2.plot(recon_tot, label='Recontruction loss', alpha=0.7)
     axs2.plot(kld_tot, label='Kullback–Leibler divergence', alpha=0.7)
     axs2.legend(fontsize=8)
     plt.ylabel('Loss value')
@@ -220,5 +257,5 @@ def visualize_results(model, noisy_data):
     plt.show()
 
 # Visualize on test data
-visualize_results(model, test_vstack)
+visualize_results(model, 'test_L44E.csv')
      

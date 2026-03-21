@@ -1,0 +1,293 @@
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
+
+
+def load_waveforms(csv_path, max_examples=100):
+    data = pd.read_csv(csv_path).transpose().values
+    if max_examples is not None:
+        data = data[:max_examples]
+    return torch.tensor(data, dtype=torch.float32)
+
+
+def make_windows(waveforms, window_size=100, step=1):
+    # waveforms: (num_examples, signal_len)
+    if window_size > waveforms.shape[1]:
+        raise ValueError(
+            f"window_size={window_size} cannot exceed signal length={waveforms.shape[1]}"
+        )
+    return waveforms.unfold(dimension=1, size=window_size, step=step)
+
+
+def overlap_average(windows, step=1):
+    # windows: (num_windows, window_size)
+    num_windows, window_size = windows.shape
+    signal_len = window_size + step * (num_windows - 1)
+    summed = torch.zeros(signal_len, dtype=windows.dtype)
+    counts = torch.zeros(signal_len, dtype=windows.dtype)
+    for i in range(num_windows):
+        start = i * step
+        end = start + window_size
+        summed[start:end] += windows[i]
+        counts[start:end] += 1.0
+    return summed / counts.clamp_min(1.0)
+
+
+def minmax_scale_train_test(train_w, test_w):
+    data_min = train_w.min()
+    data_max = train_w.max()
+    data_range = (data_max - data_min).clamp_min(1e-6)
+    train_scaled = (train_w - data_min) / data_range
+    test_scaled = (test_w - data_min) / data_range
+    return train_scaled, test_scaled, data_min, data_max
+
+
+class WindowLSTMVAE(nn.Module):
+    def __init__(self, window_size=100, hidden_dim=64, latent_dim=8, num_layers=1):
+        super().__init__()
+        self.window_size = window_size
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        self.num_layers = num_layers
+
+        self.encoder = nn.LSTM(
+            input_size=1,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+        )
+        self.to_mu = nn.Linear(hidden_dim, latent_dim)
+        self.to_logvar = nn.Linear(hidden_dim, latent_dim)
+
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, window_size),
+        )
+
+    def encode(self, x):
+        # x: (B, window_size, 1)
+        _, (h_n, _) = self.encoder(x)
+        h_last = h_n[-1]
+        mu = self.to_mu(h_last)
+        logvar = self.to_logvar(h_last)
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z):
+        out = self.decoder(z)  # (B, window_size)
+        return out.unsqueeze(-1)  # (B, window_size, 1)
+
+    def forward(self, x, sample_latent=True):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar) if sample_latent else mu
+        recon = self.decode(z)
+        return recon, mu, logvar
+
+
+def softclip(x, min_value):
+    return min_value + F.softplus(x - min_value)
+
+
+def gaussian_nll(recon, log_sigma, target):
+    const = 0.5 * torch.log(torch.tensor(2.0 * np.pi, device=target.device))
+    return 0.5 * ((target - recon) / log_sigma.exp()) ** 2 + log_sigma + const
+
+
+def vae_loss(recon, x, mu, logvar, min_log_sigma=-6.0):
+    raw_log_sigma = ((x - recon) ** 2).mean().sqrt().log()
+    log_sigma = softclip(raw_log_sigma, min_log_sigma)
+    recon_loss = gaussian_nll(recon, log_sigma, x).sum(dim=(1, 2)).mean()
+    kld = -0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
+    total = recon_loss + kld
+    return total, recon_loss, kld
+
+
+def train_model(model, loader, optimizer, num_epochs=120, device="cpu"):
+    hist_total, hist_recon, hist_kld = [], [], []
+    model.train()
+    for epoch in range(num_epochs):
+        tot, rec, kld = 0.0, 0.0, 0.0
+        n = 0
+        for (xb,) in loader:
+            xb = xb.to(device)
+            recon, mu, logvar = model(xb, sample_latent=True)
+            loss, recon_loss, kld_loss = vae_loss(recon, xb, mu, logvar)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            tot += loss.item()
+            rec += recon_loss.item()
+            kld += kld_loss.item()
+            n += 1
+
+        hist_total.append(tot / n)
+        hist_recon.append(rec / n)
+        hist_kld.append(kld / n)
+
+        if (epoch + 1) % 10 == 0:
+            print(
+                f"Epoch [{epoch+1}/{num_epochs}] "
+                f"Loss: {hist_total[-1]:.5f} | Recon: {hist_recon[-1]:.5f} | KLD: {hist_kld[-1]:.5f}"
+            )
+    return hist_total, hist_recon, hist_kld
+
+
+def mc_reconstruct_waveform(
+    model, waveform_norm, window_size=100, step=1, mc_samples=30, device="cpu"
+):
+    # waveform_norm: (signal_len,)
+    w = waveform_norm.unsqueeze(0)
+    windows = make_windows(w, window_size=window_size, step=step).squeeze(
+        0
+    )  # (num_windows, window_size)
+    x = windows.unsqueeze(-1).to(device)  # (num_windows, window_size, 1)
+
+    all_recons = []
+    model.eval()
+    with torch.no_grad():
+        for _ in range(mc_samples):
+            recon, _, _ = model(x, sample_latent=True)
+            recon_windows = recon.squeeze(-1).cpu()  # (num_windows, window_size)
+            recon_wave = overlap_average(recon_windows, step=step)
+            all_recons.append(recon_wave)
+
+    all_recons = torch.stack(all_recons, dim=0)  # (mc_samples, signal_len)
+    return all_recons.mean(dim=0), all_recons.std(dim=0), windows
+
+
+def plot_results(
+    loss_total,
+    loss_recon,
+    loss_kld,
+    noisy,
+    recon_mean,
+    recon_std,
+):
+    epochs = np.arange(1, len(loss_total) + 1)
+    fig1, ax1 = plt.subplots(1, 1, figsize=(6, 3.5))
+    ax1.plot(epochs, loss_total, label="Total")
+    ax1.plot(epochs, loss_recon, label="Recon")
+    ax1.plot(epochs, loss_kld, label="KLD")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss")
+    ax1.legend()
+    plt.tight_layout()
+    plt.show()
+
+    fig2, ax2 = plt.subplots(1, 1, figsize=(8, 4))
+    x = np.arange(noisy.shape[0])
+    ax2.plot(x, noisy, label="Noisy input", alpha=0.85)
+    ax2.plot(x, recon_mean, label="Reconstructed mean", linestyle="dashed")
+    ax2.fill_between(
+        x, recon_mean - recon_std, recon_mean + recon_std, alpha=0.2, label="±1 std"
+    )
+    ax2.set_xlabel("Sample index")
+    ax2.set_ylabel("Potential (mV)")
+    ax2.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def main():
+    # Config
+    csv_path = "test_L44E.csv"
+    max_examples = 10
+    window_size = 10
+    step = 1
+    test_size = 0.2
+    batch_size = 64
+    num_epochs = 120
+    hidden_dim = 64
+    latent_dim = 8
+    num_layers = 1
+    lr = 1e-3
+    mc_samples = 30
+    waveform_idx_to_plot = 0
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    waveforms = load_waveforms(csv_path, max_examples=max_examples)
+    train_wf_np, test_wf_np = train_test_split(
+        waveforms.numpy(), test_size=test_size, random_state=42, shuffle=True
+    )
+    train_wf = torch.tensor(train_wf_np, dtype=torch.float32)
+    test_wf = torch.tensor(test_wf_np, dtype=torch.float32)
+
+    # Window on full waveforms
+    train_windows = make_windows(train_wf, window_size=window_size, step=step)
+    test_windows = make_windows(test_wf, window_size=window_size, step=step)
+
+    # Normalize at window level using train stats
+    train_norm, test_norm, data_min, data_max = minmax_scale_train_test(
+        train_windows, test_windows
+    )
+    data_range = (data_max - data_min).clamp_min(1e-6)
+
+    # Flatten windows across waveforms for training
+    train_x = train_norm.reshape(-1, window_size).unsqueeze(-1)
+    loader = DataLoader(TensorDataset(train_x), batch_size=batch_size, shuffle=True)
+
+    model = WindowLSTMVAE(
+        window_size=window_size,
+        hidden_dim=hidden_dim,
+        latent_dim=latent_dim,
+        num_layers=num_layers,
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    loss_total, loss_recon, loss_kld = train_model(
+        model, loader, optimizer, num_epochs=num_epochs, device=device
+    )
+
+    if waveform_idx_to_plot < 0 or waveform_idx_to_plot >= len(test_wf):
+        raise ValueError(
+            f"waveform_idx_to_plot={waveform_idx_to_plot} out of range [0..{len(test_wf)-1}]"
+        )
+
+    noisy = test_wf[waveform_idx_to_plot]
+    noisy_norm = (noisy - data_min) / data_range
+    recon_mean_norm, recon_std_norm, _ = mc_reconstruct_waveform(
+        model,
+        noisy_norm,
+        window_size=window_size,
+        step=step,
+        mc_samples=mc_samples,
+        device=device,
+    )
+
+    recon_mean = recon_mean_norm * data_range + data_min
+    recon_std = recon_std_norm * data_range
+
+    print(
+        "Reconstruction uncertainty std stats: "
+        f"min={recon_std.min().item():.6f}, max={recon_std.max().item():.6f}, "
+        f"mean={recon_std.mean().item():.6f}"
+    )
+
+    plot_results(
+        loss_total=loss_total,
+        loss_recon=loss_recon,
+        loss_kld=loss_kld,
+        noisy=noisy.cpu().numpy(),
+        recon_mean=recon_mean.cpu().numpy(),
+        recon_std=recon_std.cpu().numpy(),
+    )
+
+
+if __name__ == "__main__":
+    main()

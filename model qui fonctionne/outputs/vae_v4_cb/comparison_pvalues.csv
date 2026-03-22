@@ -1,0 +1,4 @@
+metric,model_a,model_b,alternative,n_pairs,mean_diff_a_minus_b,median_diff_a_minus_b,statistic,p_value,note
+mae_norm,linear,lstm,linear_less_than_lstm,1108,0.0014310425877846805,9.747594594955444e-05,352566.0,0.9999897224522021,
+rmse_norm,linear,lstm,linear_less_than_lstm,1108,0.0014292390097524392,0.00015107542276382446,353951.0,0.9999943003824591,
+n2n_mse_norm_abs,linear,lstm,linear_less_than_lstm,1108,-0.011242409910845306,-0.01346568763256073,28374.0,2.8909359382571882e-151,

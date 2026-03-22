@@ -1,0 +1,22 @@
+{
+  "run_both_models": true,
+  "model_variants": [
+    "lstm",
+    "linear"
+  ],
+  "pipeline_mode": "train_and_evaluate",
+  "output_dir": "outputs/vae_v4_cb/linear",
+  "model_type": "linear",
+  "csv_path": "test_L44E.csv",
+  "max_examples": null,
+  "test_size": 0.2,
+  "random_state": 42,
+  "batch_size": 32,
+  "num_epochs": 100,
+  "lstm_hidden_dim": 64,
+  "linear_hidden_dim": 57,
+  "latent_dim": 2,
+  "num_layers": 1,
+  "lr": 0.001,
+  "mc_samples": 100
+}

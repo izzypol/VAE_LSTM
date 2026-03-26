@@ -10,6 +10,15 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 
+"""
+next: 
+avec le serveur, refaire l'expérience avec les windows et valider que le lstm gagne pas en perf si on fait des fenêtres (meme chose avec feedforward)
+jouer avec le nomber de couche et latent dimensions (capoable de le faire maintenant que serveur)
+faire un choix de modèle, produire les résultats et faire les graphiques pur étudier
+faire le setup sur le serveur!!!!
+install remote-ssh pour le serveur
+"""
+
 try:
     from scipy.stats import wilcoxon
 except Exception:
@@ -17,13 +26,25 @@ except Exception:
 
 
 def load_waveforms(csv_path, max_examples=100):
+    """
+    Function thatextracts the data from the csv and formats them for training 
+
+    Arguments: 
+    - csv_path: relative path that leads to the csv containing the data
+    - max_examples: sets limit of number of curves to load because it quickly becomes very time intensive 
+
+    Returns: 
+    - tensor containing the formatted data 
+    - WHAT IS THE METADATA???
+    """
+
     data = pd.read_csv(csv_path).transpose().values
     if max_examples is not None:
         data = data[:max_examples]
     decay_1 = data[:, 415:785]
     decay_2 = data[:, 1215:1585]
     stacked = np.concatenate([decay_1, decay_2], axis=0)
-    metadata = np.concatenate(
+    metadata = np.concatenate( # WHAT IS THE METADATA???? info qui permet de reconstruire la pseudosection
         [
             np.column_stack(
                 [
@@ -44,23 +65,44 @@ def load_waveforms(csv_path, max_examples=100):
 
 
 def minmax_scale_per_waveform(waveforms):
+    """
+    Function that calculates the min and max of the waveforms and also scales them
+
+    Arguments: 
+    - waveforms: the signals (num_examples, signal length)
+
+    Returns: 
+    - wf_min: the min of the waveform
+    - wf_max: the max of the waveform
+    - scaled: the scaled waveform
+
+    """
+
     # waveforms: (num_examples, signal_len)
     wf_min = waveforms.min(dim=1, keepdim=True).values
     wf_max = waveforms.max(dim=1, keepdim=True).values
-    wf_range = (wf_max - wf_min).clamp_min(1e-6)
-    scaled = (waveforms - wf_min) / wf_range
+    # normalisation
+    wf_range = (wf_max - wf_min).clamp_min(1e-6) # WHAT DOES THIS DOOOOOOO
+    scaled = (waveforms - wf_min) / wf_range # WHAT DOES THIS DOOOOOOO
+    # normalisation entre 0 et 1 et garde les min et max pour défaire la norma
     return scaled, wf_min, wf_max
 
 
 class WindowVAE(nn.Module):
+    """
+    Structure of two models: 
+    - LSTM based VAE: uses LSTM layers for both encoder and decoder, with linear layers to map to/from the latent space.
+    - Linear VAE: uses fully connected layers for both encoder and decoder, with linear layers to map to/from the latent space.
+    """
     def __init__(
         self,
-        signal_length=100,
+        signal_length=100, # default values for the model's structure and hyperparameters 
         hidden_dim=64,
         latent_dim=8,
         num_layers=1,
         model_type="lstm",
     ):
+        # by default its LSTM 
         super().__init__()
         self.signal_length = signal_length
         self.hidden_dim = hidden_dim
@@ -69,8 +111,9 @@ class WindowVAE(nn.Module):
         self.model_type = model_type
 
         if self.model_type == "lstm":
+            # encoder: LSTM layers followed by linear layers to get mu and logvar
             self.encoder = nn.LSTM(
-                input_size=1,
+                input_size=1, 
                 hidden_size=hidden_dim,
                 num_layers=num_layers,
                 batch_first=True,
@@ -78,8 +121,10 @@ class WindowVAE(nn.Module):
             self.to_mu = nn.Linear(hidden_dim, latent_dim)
             self.to_logvar = nn.Linear(hidden_dim, latent_dim)
 
+            # map the latent vector to the hidden state of the decoder
             self.latent_to_hidden = nn.Linear(latent_dim, hidden_dim)
             self.latent_to_input = nn.Linear(latent_dim, 1)
+            # decoder: LSTM layers followed by a linear layer to get the output features
             self.decoder = nn.LSTM(
                 input_size=1,
                 hidden_size=hidden_dim,
@@ -88,6 +133,7 @@ class WindowVAE(nn.Module):
             )
             self.to_output = nn.Linear(hidden_dim, 1)
         elif self.model_type == "linear":
+            # fully connected non-lstm option 
             encoder_layers = [nn.Linear(signal_length, hidden_dim), nn.SiLU()]
             for _ in range(max(0, num_layers - 1)):
                 encoder_layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.SiLU()])
@@ -101,28 +147,64 @@ class WindowVAE(nn.Module):
             decoder_layers.append(nn.Linear(hidden_dim, signal_length))
             self.decoder_mlp = nn.Sequential(*decoder_layers)
         else:
+            # what to do if model_type is not recognized
             raise ValueError(
                 f"Unsupported model_type={self.model_type}. Use 'lstm' or 'linear'."
             )
 
     def encode(self, x):
+        """
+        Function that does the steps and calculations for the encoder section  
+
+        Arguments: 
+        - self: the model
+        - x: the input data (B, signal length, 1)
+
+        Returns: 
+        - mu: the mean vector 
+        - logvar: the log variance vector
+        """
         # x: (B, signal_length, 1)
         if self.model_type == "lstm":
-            _, (h_n, _) = self.encoder(x)
-            h_last = h_n[-1]
-        else:
+            _, (h_n, _) = self.encoder(x) # get the hidden state
+            h_last = h_n[-1] # get the hidden state of the last layer
+        else: # for the non-lstm model
             x_flat = x.squeeze(-1)
             h_last = self.encoder_mlp(x_flat)
+        
+        # calculate the mean and the logarithm of the variance (latent space variables)
         mu = self.to_mu(h_last)
         logvar = self.to_logvar(h_last)
         return mu, logvar
 
     def reparameterize(self, mu, logvar):
+        """
+        Function that does the reparametrization trick 
+
+        Arguments: 
+        - self: the model
+        - mu: the mean vector from the encoder
+        - logvar: the log variance vector from the encoder
+
+        Returns: 
+        - reparamed vector
+        """
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
 
     def decode(self, z):
+        """ function that does the steps and calculations for the encoder section
+        
+        Arguments: 
+        - self: the model
+        - z: the input form the latent space
+
+        Returns: 
+        - out: the reconstructed output data 
+        
+        """
+
         if self.model_type == "lstm":
             h0 = self.latent_to_hidden(z).unsqueeze(0).repeat(self.num_layers, 1, 1)
             c0 = torch.zeros_like(h0)
@@ -130,10 +212,24 @@ class WindowVAE(nn.Module):
             dec_input = latent_step.repeat(1, self.signal_length, 1)
             dec_out, _ = self.decoder(dec_input, (h0, c0))
             return self.to_output(dec_out)
-        out = self.decoder_mlp(z)
+        # section just for the non-lstm model
+        out = self.decoder_mlp(z) 
         return out.unsqueeze(-1)
 
     def forward(self, x, sample_latent=True):
+        """
+        Function that allows the code to go through the layers of model
+
+        Arguments: 
+        - self: the model
+        - x: the input data 
+        - sample latent: si on voulait déterministe, on ferait false et on ferait pas le reparam trick (donne la moyenne)
+
+        Returns: 
+        - recon: the reconstructed output data 
+        - mu: the mean vector 
+        - logvar: the logarithm variance vector
+        """
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar) if sample_latent else mu
         recon = self.decode(z)
@@ -141,15 +237,51 @@ class WindowVAE(nn.Module):
 
 
 def softclip(x, min_value):
+    """
+    Function that clips the tensor values at the minimum value in a softway (source: sigma-vae-pytorch by orybkin, Handful of Trials)
+
+    Arguments: 
+    - x: input data
+    - min_value: the minimum value ot consider 
+
+    Returns: 
+    - the softclip 
+    """
     return min_value + F.softplus(x - min_value)
 
 
 def gaussian_nll(recon, log_sigma, target):
+    """
+    Function that calculates the gaussian negative log likelyhood 
+
+    Arguments:
+    - recon: the reconstructed data 
+    - log_sigma: the standard deviation 
+    - target: 
+
+    Returns: 
+    - the gaussian negative loss likelyhood 
+    """
     const = 0.5 * torch.log(torch.tensor(2.0 * np.pi, device=target.device))
     return 0.5 * ((target - recon) / log_sigma.exp()) ** 2 + log_sigma + const
 
 
 def vae_loss(recon, x, mu, logvar, min_log_sigma=-6.0):
+    """ 
+    Function that calculates the loss for the model (includes the gaussian nnl, the reconstruction loss, and the Kullback-Liebler divergence)
+
+    Arguments: 
+    - recon: the reconstructed data
+    - x: the input data 
+    - mu: the mean vector 
+    - logvar: the logarithm variance vector 
+    - min_log_sigma: the minimum for log_sigma 
+
+    Returns: 
+    - total: the combination of the reconstruction loss and the kld 
+    - recon_loss: the reconstruction loss 
+    - kld: the Kullback-Liebler divergence 
+    """
     raw_log_sigma = ((x - recon) ** 2).mean().sqrt().log()
     log_sigma = softclip(raw_log_sigma, min_log_sigma)
     recon_loss = gaussian_nll(recon, log_sigma, x).sum(dim=(1, 2)).mean()
@@ -159,10 +291,26 @@ def vae_loss(recon, x, mu, logvar, min_log_sigma=-6.0):
 
 
 def train_model(model, loader, optimizer, num_epochs=120, device="cpu"):
+    """
+    Function that does the training of the model 
+
+    Arguments: 
+    - model: the model
+    - loader: what
+    - optimizer: the function used for the optimization 
+    - num_epochs: the number of epochs (number of times the calculations are repeated), by default 120
+    - device: where the calculations are done in the computer 
+
+    Returns: 
+    - hist_total: list containing the mean total loss values 
+    - hist_recon: list contining the mean reconstruction loss values 
+    - hist_kld: list containing the mean kld values 
+    """
+
     hist_total, hist_recon, hist_kld = [], [], []
-    model.train()
-    for epoch in range(num_epochs):
-        tot, rec, kld = 0.0, 0.0, 0.0
+    model.train() # put in training mode 
+    for epoch in range(num_epochs): # cycle through the epochs 
+        tot, rec, kld = 0.0, 0.0, 0.0 # initialise 
         n = 0
         for (xb,) in loader:
             xb = xb.to(device)
@@ -178,7 +326,8 @@ def train_model(model, loader, optimizer, num_epochs=120, device="cpu"):
             kld += kld_loss.item()
             n += 1
 
-        hist_total.append(tot / n)
+        # only append the average value and not the raw value (too much variation in teh values)
+        hist_total.append(tot / n) 
         hist_recon.append(rec / n)
         hist_kld.append(kld / n)
 
@@ -197,14 +346,29 @@ def mc_reconstruct_waveform(
     device="cpu",
     return_samples=False,
 ):
+    
+    """
+    Function that reconstructs the waveform from the eval step 
+
+    Arguments:
+    - model: the model 
+    - waveform_norm: normalised waveforms
+    - mc samples: by default 30
+    - return_samples: weather or not to return the reconstructed sample list without averaging 
+
+    Returns: 
+    - all_recons.mean: the averaged list of the reconstructed values 
+    - all_recons.std: the standard deviation of the reconstructed values 
+    """
     # waveform_norm: (signal_len,)
     x = waveform_norm.unsqueeze(0).unsqueeze(-1).to(device)  # (1, signal_len, 1)
 
     all_recons = []
+    # put in evaluation mode 
     model.eval()
     with torch.no_grad():
         for _ in range(mc_samples):
-            recon, _, _ = model(x, sample_latent=True)
+            recon, _, _ = model(x, sample_latent=True) # calulate the reconstructed values 
             recon_wave = recon.squeeze(0).squeeze(-1).cpu()  # (signal_len,)
             all_recons.append(recon_wave)
 
@@ -215,6 +379,18 @@ def mc_reconstruct_waveform(
 
 
 def plot_training_losses(loss_total, loss_recon, loss_kld):
+    """
+    Function that plots the evolution of the loss throughout the training 
+
+    Arguments: 
+    - loss_total: list containing the total loss values 
+    - loss_recon: list containing the reconstruction loss values 
+    - loss_kld: list containing the kld values 
+
+    Returns: 
+    - nothing but displays a graph showing the evolution of the three loss values in function of the epochs
+    """
+
     epochs = np.arange(1, len(loss_total) + 1)
     fig1, ax1 = plt.subplots(1, 1, figsize=(6, 3.5))
     ax1.plot(epochs, loss_total, label="Total")
@@ -231,9 +407,19 @@ def plot_reconstruction_with_uncertainty(
     noisy,
     recon_mean,
     recon_std,
-    ci_lower=None,
+    ci_lower=None, # what are these 
     ci_upper=None,
 ):
+    
+    """
+    Function that plots the reconstructed values and their uncertainty 
+
+    Arguments: 
+    - noisy: the raw data
+    - recon_mean: the average of the recontructed values 
+    - recon_std: the standard deviation of the reconstructed values
+    - ci_lower/upper: (confidence intervale) si on connait les erreur de constru on peut les passer mais mieux de les calculer
+    """
     fig2, ax2 = plt.subplots(1, 1, figsize=(8, 4))
     x = np.arange(noisy.shape[0])
     ax2.plot(x, noisy, ".k", label="Noisy input", alpha=0.85)
@@ -272,6 +458,10 @@ def predict_test_set(
     mc_samples,
     device,
 ):
+    """
+    Not sure what this function does? prepare the test data?
+    apre`s entrainement, prédire sur les waveform de test. pur le faire, on prend le tenseur, passer au modele. apres il faut reconstruire le waveform et défaire la nroamlisation 
+    """
     recon_means = []
     recon_stds = []
     recon_means_norm = []
@@ -316,6 +506,16 @@ def predict_test_set(
 
 
 def compute_denoising_metrics(test_wf, recon_means):
+    """
+    Function that calculate the different metrics necessary for the other functions (mean and std)
+
+    Arguments: 
+    - test_wf: the test waveforms 
+    - recon_means: the mean values of the reconstructed inputs 
+
+    Returns: 
+    - library of the different mean and std values calculated 
+    """
     errors = recon_means - test_wf
     mae_per_waveform = torch.mean(torch.abs(errors), dim=1)
     rmse_per_waveform = torch.sqrt(torch.mean(errors**2, dim=1))
@@ -382,6 +582,9 @@ def save_training_artifacts(
     loss_kld,
     training_time_seconds,
 ):
+    """
+    Function that savex the artifacts that might come up in training 
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / "model_weights.pt"
     torch.save(
@@ -418,6 +621,9 @@ def save_evaluation_artifacts(
     recon_stds,
     test_wf,
 ):
+    """
+    Function that saves the artifacts that might show up during testing 
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     test_results_df.to_csv(output_dir / "test_results.csv", index=False)
     pd.DataFrame([metrics_summary]).to_csv(
@@ -434,6 +640,16 @@ def save_evaluation_artifacts(
 
 
 def prepare_data(config):
+    """
+    Function that prepares the data from the csv 
+
+    Arguments: 
+    - config: variable that contains all the specifications that tell the code how to run the model
+
+    Returns: 
+    - library containing the necessary information pertaining to the extracted data 
+    """
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     waveforms, waveform_meta = load_waveforms(
         config["csv_path"], max_examples=config["max_examples"]
@@ -478,6 +694,17 @@ def prepare_data(config):
 
 
 def build_model(config, device, signal_length):
+    """
+    Function that builds the model according to specifications
+
+    Arguments: 
+    - config: the specifications for the model
+    - device: where the calculations will be done 
+    - signal_length: length of the signal to be treated
+
+    Returns: 
+    - nothing but it builds the model
+    """
     if config["model_type"] == "lstm":
         hidden_dim = config["lstm_hidden_dim"]
     else:
@@ -492,6 +719,16 @@ def build_model(config, device, signal_length):
 
 
 def load_training_history(output_dir):
+    """
+    Function that saves the training history of the model 
+
+    Arguments: 
+    - output_dir: contains different training history variables 
+
+    Returns: 
+    - lists containing the training history values  
+    """
+
     history_path = Path(output_dir) / "training_history.csv"
     if not history_path.exists():
         return [], [], []
@@ -504,6 +741,10 @@ def load_training_history(output_dir):
 
 
 def load_training_time_seconds(output_dir):
+    """
+    Function that records the time it takes to train the model 
+    """
+
     summary_path = Path(output_dir) / "training_summary.csv"
     if not summary_path.exists():
         return 0.0
@@ -514,6 +755,9 @@ def load_training_time_seconds(output_dir):
 
 
 def resolve_model_output_dir(config):
+    """
+    Unsure what this does 
+    """
     base = Path(config["output_dir"])
     model_dir_name = str(config["model_type"])
     if base.name == model_dir_name:
@@ -529,6 +773,10 @@ def resolve_checkpoint_path(config):
 
 
 def run_training(config, prepared=None):
+    """ 
+    Function that runs the training of the model 
+    """
+
     prepared = prepare_data(config) if prepared is None else prepared
     device = prepared["device"]
     print(f"Using device: {device}")
@@ -571,6 +819,10 @@ def run_training(config, prepared=None):
 
 
 def run_evaluation(config, model=None, prepared=None):
+    """
+    Function that runs the testing and evaluation of the model 
+    """
+
     prepared = prepare_data(config) if prepared is None else prepared
     device = prepared["device"]
     print(f"Using device: {device}")
@@ -679,6 +931,10 @@ def run_experiment(config):
 
 
 def plot_training_losses_from_run_output(run_output):
+    """
+    Function that plots the losses from the training of the model
+    """
+
     plot_training_losses(
         loss_total=run_output["loss_total"],
         loss_recon=run_output["loss_recon"],
@@ -687,6 +943,10 @@ def plot_training_losses_from_run_output(run_output):
 
 
 def plot_reconstruction_from_run_output(run_output, selected_idx=None):
+    """
+    Function that plots the reconstructed output values 
+    """
+
     if selected_idx is None:
         selected_idx = 0
     if selected_idx < 0 or selected_idx >= len(run_output["test_wf"]):
@@ -742,6 +1002,10 @@ def plot_from_run_output(run_output, selected_idx=None):
 
 
 def run_model_comparison(base_config, model_variants=("lstm", "linear")):
+    """
+    Function that compares the lstm and linear models with the same base configuration 
+    """
+
     if base_config.get("pipeline_mode", "train_and_evaluate") == "train_only":
         raise ValueError(
             "run_model_comparison requires evaluation outputs. "
@@ -879,7 +1143,7 @@ CONFIG = {
     "random_state": 42,
     "batch_size": 32,
     "num_epochs": 100,
-    "lstm_hidden_dim": 64,
+    "lstm_hidden_dim": 64, # 64 hidden dim permet d'avoir qqch de comaprable avec feedforward
     "linear_hidden_dim": 57,
     "latent_dim": 2,
     "num_layers": 1,

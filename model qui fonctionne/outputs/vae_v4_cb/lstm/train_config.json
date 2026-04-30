@@ -18,5 +18,5 @@
   "latent_dim": 2,
   "num_layers": 1,
   "lr": 0.001,
-  "mc_samples": 100
+  "mc_samples": 10
 }

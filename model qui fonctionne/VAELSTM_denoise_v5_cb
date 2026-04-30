@@ -1,0 +1,1570 @@
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import json
+import time
+from pathlib import Path
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
+from pandas.plotting import autocorrelation_plot
+from pandas import Series
+from scipy.fft import fft, fftfreq
+
+test = "test"
+print(test)
+
+"""
+next: 
+avec le serveur, refaire l'expérience avec les windows et valider que le lstm gagne pas en perf si on fait des fenêtres (meme chose avec feedforward)
+jouer avec le nomber de couche et latent dimensions (capoable de le faire maintenant que serveur)
+faire un choix de modèle, produire les résultats et faire les graphiques pur étudier
+faire le setup sur le serveur!!!!
+install remote-ssh pour le serveur
+"""
+
+try:
+    from scipy.stats import wilcoxon
+except Exception:
+    wilcoxon = None
+
+
+def load_waveforms(csv_path, max_examples=100):
+    """
+    Function thatextracts the data from the csv and formats them for training 
+
+    Arguments: 
+    - csv_path: relative path that leads to the csv containing the data
+    - max_examples: sets limit of number of curves to load because it quickly becomes very time intensive 
+
+    Returns: 
+    - tensor containing the formatted data 
+    - WHAT IS THE METADATA???
+    """
+
+    data = pd.read_csv(csv_path).transpose().values
+    if max_examples is not None:
+        data = data[:max_examples]
+    decay_1 = data[:, 415:785]
+    decay_2 = data[:, 1215:1585]
+    stacked = np.concatenate([decay_1, decay_2], axis=0)
+    metadata = np.concatenate( # WHAT IS THE METADATA???? info qui permet de reconstruire la pseudosection
+        [
+            np.column_stack(
+                [
+                    np.arange(decay_1.shape[0], dtype=int),
+                    np.zeros(decay_1.shape[0], dtype=int),
+                ]
+            ),
+            np.column_stack(
+                [
+                    np.arange(decay_2.shape[0], dtype=int),
+                    np.ones(decay_2.shape[0], dtype=int),
+                ]
+            ),
+        ],
+        axis=0,
+    )
+    return torch.tensor(stacked, dtype=torch.float32), metadata
+
+
+def minmax_scale_per_waveform(waveforms):
+    """
+    Function that calculates the min and max of the waveforms and also scales them
+
+    Arguments: 
+    - waveforms: the signals (num_examples, signal length)
+
+    Returns: 
+    - wf_min: the min of the waveform
+    - wf_max: the max of the waveform
+    - scaled: the scaled waveform
+
+    """
+
+    # waveforms: (num_examples, signal_len)
+    wf_min = waveforms.min(dim=1, keepdim=True).values
+    wf_max = waveforms.max(dim=1, keepdim=True).values
+    # normalisation
+    wf_range = (wf_max - wf_min).clamp_min(1e-6) # WHAT DOES THIS DOOOOOOO
+    scaled = (waveforms - wf_min) / wf_range # WHAT DOES THIS DOOOOOOO
+    # normalisation entre 0 et 1 et garde les min et max pour défaire la norma
+    return scaled, wf_min, wf_max
+
+
+class WindowVAE(nn.Module):
+    """
+    Structure of two models: 
+    - LSTM based VAE: uses LSTM layers for both encoder and decoder, with linear layers to map to/from the latent space.
+    - Linear VAE: uses fully connected layers for both encoder and decoder, with linear layers to map to/from the latent space.
+    """
+    def __init__(
+        self,
+        signal_length=100, # default values for the model's structure and hyperparameters 
+        hidden_dim=64,
+        latent_dim=8,
+        num_layers=1,
+        model_type="lstm",
+    ):
+        # by default its LSTM 
+        super().__init__()
+        self.signal_length = signal_length
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        self.num_layers = num_layers
+        self.model_type = model_type
+
+        if self.model_type == "lstm":
+            # encoder: LSTM layers followed by linear layers to get mu and logvar
+            self.encoder = nn.LSTM(
+                input_size=1, 
+                hidden_size=hidden_dim,
+                num_layers=num_layers,
+                batch_first=True,
+            )
+            self.to_mu = nn.Linear(hidden_dim, latent_dim)
+            self.to_logvar = nn.Linear(hidden_dim, latent_dim)
+
+            # map the latent vector to the hidden state of the decoder
+            self.latent_to_hidden = nn.Linear(latent_dim, hidden_dim)
+            self.latent_to_input = nn.Linear(latent_dim, 1)
+            # decoder: LSTM layers followed by a linear layer to get the output features
+            self.decoder = nn.LSTM(
+                input_size=1,
+                hidden_size=hidden_dim,
+                num_layers=num_layers,
+                batch_first=True,
+            )
+            self.to_output = nn.Linear(hidden_dim, 1)
+        elif self.model_type == "linear":
+            # fully connected non-lstm option 
+            encoder_layers = [nn.Linear(signal_length, hidden_dim), nn.SiLU()]
+            for _ in range(max(0, num_layers - 1)):
+                encoder_layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.SiLU()])
+            self.encoder_mlp = nn.Sequential(*encoder_layers)
+            self.to_mu = nn.Linear(hidden_dim, latent_dim)
+            self.to_logvar = nn.Linear(hidden_dim, latent_dim)
+
+            decoder_layers = [nn.Linear(latent_dim, hidden_dim), nn.SiLU()]
+            for _ in range(max(0, num_layers - 1)):
+                decoder_layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.SiLU()])
+            decoder_layers.append(nn.Linear(hidden_dim, signal_length))
+            self.decoder_mlp = nn.Sequential(*decoder_layers)
+        else:
+            # what to do if model_type is not recognized
+            raise ValueError(
+                f"Unsupported model_type={self.model_type}. Use 'lstm' or 'linear'."
+            )
+
+    def encode(self, x):
+        """
+        Function that does the steps and calculations for the encoder section  
+
+        Arguments: 
+        - self: the model
+        - x: the input data (B, signal length, 1)
+
+        Returns: 
+        - mu: the mean vector 
+        - logvar: the log variance vector
+        """
+        # x: (B, signal_length, 1)
+        if self.model_type == "lstm":
+            _, (h_n, _) = self.encoder(x) # get the hidden state
+            h_last = h_n[-1] # get the hidden state of the last layer
+        else: # for the non-lstm model
+            x_flat = x.squeeze(-1)
+            h_last = self.encoder_mlp(x_flat)
+        
+        # calculate the mean and the logarithm of the variance (latent space variables)
+        mu = self.to_mu(h_last)
+        logvar = self.to_logvar(h_last)
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        """
+        Function that does the reparametrization trick 
+
+        Arguments: 
+        - self: the model
+        - mu: the mean vector from the encoder
+        - logvar: the log variance vector from the encoder
+
+        Returns: 
+        - reparamed vector
+        """
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z):
+        """ function that does the steps and calculations for the encoder section
+        
+        Arguments: 
+        - self: the model
+        - z: the input form the latent space
+
+        Returns: 
+        - out: the reconstructed output data 
+        
+        """
+
+        if self.model_type == "lstm":
+            h0 = self.latent_to_hidden(z).unsqueeze(0).repeat(self.num_layers, 1, 1)
+            c0 = torch.zeros_like(h0)
+            latent_step = self.latent_to_input(z).unsqueeze(1)
+            dec_input = latent_step.repeat(1, self.signal_length, 1)
+            dec_out, _ = self.decoder(dec_input, (h0, c0))
+            return self.to_output(dec_out)
+        # section just for the non-lstm model
+        out = self.decoder_mlp(z) 
+        return out.unsqueeze(-1)
+
+    def forward(self, x, sample_latent=True):
+        """
+        Function that allows the code to go through the layers of model
+
+        Arguments: 
+        - self: the model
+        - x: the input data 
+        - sample latent: si on voulait déterministe, on ferait false et on ferait pas le reparam trick (donne la moyenne)
+
+        Returns: 
+        - recon: the reconstructed output data 
+        - mu: the mean vector 
+        - logvar: the logarithm variance vector
+        """
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar) if sample_latent else mu
+        recon = self.decode(z)
+        return recon, mu, logvar
+
+
+def softclip(x, min_value):
+    """
+    Function that clips the tensor values at the minimum value in a softway (source: sigma-vae-pytorch by orybkin, Handful of Trials)
+
+    Arguments: 
+    - x: input data
+    - min_value: the minimum value ot consider 
+
+    Returns: 
+    - the softclip 
+    """
+    return min_value + F.softplus(x - min_value)
+
+
+def gaussian_nll(recon, log_sigma, target):
+    """
+    Function that calculates the gaussian negative log likelyhood 
+
+    Arguments:
+    - recon: the reconstructed data 
+    - log_sigma: the standard deviation 
+    - target: 
+
+    Returns: 
+    - the gaussian negative loss likelyhood 
+    """
+    const = 0.5 * torch.log(torch.tensor(2.0 * np.pi, device=target.device))
+    return 0.5 * ((target - recon) / log_sigma.exp()) ** 2 + log_sigma + const
+
+
+def vae_loss(recon, x, mu, logvar, min_log_sigma=-6.0):
+    """ 
+    Function that calculates the loss for the model (includes the gaussian nnl, the reconstruction loss, and the Kullback-Liebler divergence)
+
+    Arguments: 
+    - recon: the reconstructed data
+    - x: the input data 
+    - mu: the mean vector 
+    - logvar: the logarithm variance vector 
+    - min_log_sigma: the minimum for log_sigma 
+
+    Returns: 
+    - total: the combination of the reconstruction loss and the kld 
+    - recon_loss: the reconstruction loss 
+    - kld: the Kullback-Liebler divergence 
+    """
+    raw_log_sigma = ((x - recon) ** 2).mean().sqrt().log()
+    log_sigma = softclip(raw_log_sigma, min_log_sigma)
+    recon_loss = gaussian_nll(recon, log_sigma, x).sum(dim=(1, 2)).mean()
+    kld = -0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
+    total = recon_loss + kld
+    return total, recon_loss, kld
+
+
+def train_model(model, loader, optimizer, num_epochs=120, device="cpu"):
+    """
+    Function that does the training of the model 
+
+    Arguments: 
+    - model: the model
+    - loader: what
+    - optimizer: the function used for the optimization 
+    - num_epochs: the number of epochs (number of times the calculations are repeated), by default 120
+    - device: where the calculations are done in the computer 
+
+    Returns: 
+    - hist_total: list containing the mean total loss values 
+    - hist_recon: list contining the mean reconstruction loss values 
+    - hist_kld: list containing the mean kld values 
+    """
+
+    hist_total, hist_recon, hist_kld = [], [], []
+    model.train() # put in training mode 
+    for epoch in range(num_epochs): # cycle through the epochs 
+        tot, rec, kld = 0.0, 0.0, 0.0 # initialise 
+        n = 0
+        for (xb,) in loader:
+            xb = xb.to(device)
+            recon, mu, logvar = model(xb, sample_latent=True)
+            loss, recon_loss, kld_loss = vae_loss(recon, xb, mu, logvar)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            tot += loss.item()
+            rec += recon_loss.item()
+            kld += kld_loss.item()
+            n += 1
+
+        # only append the average value and not the raw value (too much variation in teh values)
+        hist_total.append(tot / n) 
+        hist_recon.append(rec / n)
+        hist_kld.append(kld / n)
+
+        if (epoch + 1) % 10 == 0:
+            print(
+                f"Epoch [{epoch+1}/{num_epochs}] "
+                f"Loss: {hist_total[-1]:.5f} | Recon: {hist_recon[-1]:.5f} | KLD: {hist_kld[-1]:.5f}"
+            )
+    return hist_total, hist_recon, hist_kld
+
+
+def mc_reconstruct_waveform(
+    model,
+    waveform_norm,
+    mc_samples=30,
+    device="cpu",
+    return_samples=False,
+):
+    
+    """
+    Function that reconstructs the waveform from the eval step 
+
+    Arguments:
+    - model: the model 
+    - waveform_norm: normalised waveforms
+    - mc samples: by default 30
+    - return_samples: weather or not to return the reconstructed sample list without averaging 
+
+    Returns: 
+    - all_recons.mean: the averaged list of the reconstructed values 
+    - all_recons.std: the standard deviation of the reconstructed values 
+    """
+    # waveform_norm: (signal_len,)
+    x = waveform_norm.unsqueeze(0).unsqueeze(-1).to(device)  # (1, signal_len, 1)
+
+    all_recons = []
+    # put in evaluation mode 
+    model.eval()
+    with torch.no_grad():
+        for _ in range(mc_samples):
+            recon, _, _ = model(x, sample_latent=True) # calulate the reconstructed values 
+            recon_wave = recon.squeeze(0).squeeze(-1).cpu()  # (signal_len,)
+            all_recons.append(recon_wave)
+
+    all_recons = torch.stack(all_recons, dim=0)  # (mc_samples, signal_len)
+    if return_samples:
+        return all_recons.mean(dim=0), all_recons.std(dim=0), all_recons
+    return all_recons.mean(dim=0), all_recons.std(dim=0)
+
+
+def plot_training_losses(loss_total, loss_recon, loss_kld):
+    """
+    Function that plots the evolution of the loss throughout the training 
+
+    Arguments: 
+    - loss_total: list containing the total loss values 
+    - loss_recon: list containing the reconstruction loss values 
+    - loss_kld: list containing the kld values 
+
+    Returns: 
+    - nothing but displays a graph showing the evolution of the three loss values in function of the epochs
+    """
+
+    epochs = np.arange(1, len(loss_total) + 1)
+    fig1, ax1 = plt.subplots(1, 1, figsize=(6, 3.5))
+    ax1.plot(epochs, loss_total, label="Total")
+    ax1.plot(epochs, loss_recon, label="Recon")
+    ax1.plot(epochs, loss_kld, label="KLD")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss")
+    ax1.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_reconstruction_with_uncertainty(
+    noisy,
+    recon_mean,
+    recon_std,
+    ci_lower=None, # what are these 
+    ci_upper=None,
+):
+    
+    """
+    Function that plots the reconstructed values and their uncertainty 
+
+    Arguments: 
+    - noisy: the raw data
+    - recon_mean: the average of the recontructed values 
+    - recon_std: the standard deviation of the reconstructed values
+    - ci_lower/upper: (confidence intervale) si on connait les erreur de constru on peut les passer mais mieux de les calculer
+    """
+    fig2, ax2 = plt.subplots(1, 1, figsize=(8, 4))
+    x = np.arange(noisy.shape[0])
+    ax2.plot(x, noisy, ".k", label="Noisy input", alpha=0.85)
+    ax2.plot(x, recon_mean, label="Reconstructed mean", linestyle="-")
+    if ci_lower is not None and ci_upper is not None:
+        ax2.fill_between(
+            x,
+            ci_lower,
+            ci_upper,
+            alpha=0.2,
+            label="95% CI",
+        )
+    else:
+        ci95 = 1.96 * recon_std
+        ax2.fill_between(
+            x,
+            recon_mean - ci95,
+            recon_mean + ci95,
+            alpha=0.2,
+            label="95% CI",
+        )
+    ax2.set_xlabel("Sample index")
+    ax2.set_ylabel("Potential (mV)")
+    ax2.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def predict_test_set(
+    model,
+    test_wf,
+    test_wf_norm,
+    test_wf_min,
+    test_wf_max,
+    test_meta,
+    mc_samples,
+    device,
+):
+    """
+    Not sure what this function does? prepare the test data?
+    apre`s entrainement, prédire sur les waveform de test. pur le faire, on prend le tenseur, passer au modele. apres il faut reconstruire le waveform et défaire la nroamlisation 
+    """
+    recon_means = []
+    recon_stds = []
+    recon_means_norm = []
+    recon_stds_norm = []
+
+    for i in range(len(test_wf)):
+        noisy = test_wf[i]
+        noisy_norm = test_wf_norm[i]
+        waveform_min = test_wf_min[i, 0]
+        waveform_max = test_wf_max[i, 0]
+        waveform_range = (waveform_max - waveform_min).clamp_min(1e-6)
+
+        recon_mean_norm, recon_std_norm = mc_reconstruct_waveform(
+            model,
+            noisy_norm,
+            mc_samples=mc_samples,
+            device=device,
+        )
+        recon_means_norm.append(recon_mean_norm)
+        recon_stds_norm.append(recon_std_norm)
+
+        recon_mean_repr = recon_mean_norm * waveform_range + waveform_min
+        recon_std_repr = recon_std_norm * waveform_range
+        recon_mean, recon_std = recon_mean_repr, recon_std_repr
+
+        recon_means.append(recon_mean)
+        recon_stds.append(recon_std)
+
+    recon_means = torch.stack(recon_means)
+    recon_stds = torch.stack(recon_stds)
+    recon_means_norm = torch.stack(recon_means_norm)
+    recon_stds_norm = torch.stack(recon_stds_norm)
+
+    df = pd.DataFrame(
+        {
+            "test_idx": np.arange(len(test_wf)),
+            "source_waveform_idx": test_meta[:, 0].astype(int),
+            "decay_id": test_meta[:, 1].astype(int),
+        }
+    )
+    return recon_means, recon_stds, recon_means_norm, recon_stds_norm, df
+
+
+def compute_denoising_metrics(test_wf, recon_means):
+    """
+    Function that calculate the different metrics necessary for the other functions (mean and std)
+
+    Arguments: 
+    - test_wf: the test waveforms 
+    - recon_means: the mean values of the reconstructed inputs 
+
+    Returns: 
+    - library of the different mean and std values calculated 
+    """
+    errors = recon_means - test_wf
+    mae_per_waveform = torch.mean(torch.abs(errors), dim=1)
+    rmse_per_waveform = torch.sqrt(torch.mean(errors**2, dim=1))
+
+    return {
+        "mae_per_waveform": mae_per_waveform,
+        "rmse_per_waveform": rmse_per_waveform,
+        "mae_mean": float(mae_per_waveform.mean().item()),
+        "mae_std": float(mae_per_waveform.std().item()),
+        "rmse_mean": float(rmse_per_waveform.mean().item()),
+        "rmse_std": float(rmse_per_waveform.std().item()),
+    }
+
+# SoUSTRAIRE TEST DE RECON PoUR RéSIDU!!!!!
+def compute_neighbor2neighbor_metrics(test_wf, recon_means, test_meta):
+    """Neighbor2Neighbor metric using paired decays from the same source waveform.
+
+    For each source waveform with both decay_id 0 and 1 present:
+      n2n = 0.5 * (MSE(|recon_0|, |noisy_1|) + MSE(|recon_1|, |noisy_0|))
+    """
+    n = len(test_wf)
+    per_example = np.full(n, np.nan, dtype=float)
+
+    source_ids = test_meta[:, 0].astype(int)
+    decay_ids = test_meta[:, 1].astype(int)
+    source_to_rows = {}
+    for i, (src, dec) in enumerate(zip(source_ids, decay_ids)):
+        if src not in source_to_rows:
+            source_to_rows[src] = {}
+        source_to_rows[src][int(dec)] = i
+
+    per_source_vals = []
+    for src, rows in source_to_rows.items():
+        if 0 not in rows or 1 not in rows:
+            continue
+        i0, i1 = rows[0], rows[1]
+        mse_01 = torch.mean(
+            (torch.abs(recon_means[i0]) - torch.abs(test_wf[i1])) ** 2
+        ).item()
+        mse_10 = torch.mean(
+            (torch.abs(recon_means[i1]) - torch.abs(test_wf[i0])) ** 2
+        ).item()
+        val = 0.5 * (mse_01 + mse_10)
+        per_source_vals.append(val)
+        per_example[i0] = val
+        per_example[i1] = val
+
+    per_source = np.asarray(per_source_vals, dtype=float)
+    return {
+        "n2n_per_example": per_example,
+        "n2n_per_source": per_source,
+        "n2n_mean": float(np.nanmean(per_source)) if per_source.size else float("nan"),
+        "n2n_std": float(np.nanstd(per_source)) if per_source.size else float("nan"),
+        "n2n_count_sources": int(per_source.size),
+    }
+
+def residu_eval(test_wf, recon_means, test_meta):
+    """
+    Function that calculates the residues (difference between the reconstructed values and the raw data) for the paired decays from the same source waveform.
+
+    Arguments: 
+    - test_wf: the test waveforms
+    - recon_means: the mean values of the reconstructed inputs
+    - test_meta: the metadata that contains the information about the source waveform and the decay id
+
+    Returns: 
+    - residues: the value of the residues
+    - other stuff?
+    """
+
+    """
+    Note: J'utilise la même structure que la fonction n2n
+    """
+    n = len(test_wf)
+    per_example = np.full(n, np.nan, dtype=float)
+
+    source_ids = test_meta[:, 0].astype(int)
+    decay_ids = test_meta[:, 1].astype(int)
+    source_to_rows = {}
+    for i, (src, dec) in enumerate(zip(source_ids, decay_ids)):
+        if src not in source_to_rows:
+            source_to_rows[src] = {}
+        source_to_rows[src][int(dec)] = i
+
+    per_source_vals = []
+    for src, rows in source_to_rows.items():
+        if 0 not in rows or 1 not in rows:
+            continue
+        i0, i1 = rows[0], rows[1]
+        residus1 = torch.mean(torch.abs(test_wf[i0]) - torch.abs(recon_means[i0]))
+        residus2 = torch.mean(torch.abs(test_wf[i1]) - torch.abs(recon_means[i1]))
+        res_mean = 0.5*(residus1 + residus2)
+        per_source_vals.append(res_mean)
+
+        per_example[i0] = residus1
+        per_example[i1] = residus2
+
+    per_source = np.asarray(per_source_vals, dtype=float)
+    return {
+        "resid_per_example": per_example,
+        "resid_per_source": per_source,
+        "resid_mean": float(np.nanmean(per_source)) if per_source.size else float("nan"),
+        "resid_std": float(np.nanstd(per_source)) if per_source.size else float("nan"),
+        "resid_count_sources": int(per_source.size),
+    }
+
+
+def save_training_artifacts(
+    output_dir,
+    model,
+    config,
+    loss_total,
+    loss_recon,
+    loss_kld,
+    training_time_seconds,
+):
+    """
+    Function that savex the artifacts that might come up in training 
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_dir / "model_weights.pt"
+    torch.save(
+        {"model_state_dict": model.state_dict(), "config": config}, checkpoint_path
+    )
+    pd.DataFrame(
+        {
+            "epoch": np.arange(1, len(loss_total) + 1),
+            "loss_total": loss_total,
+            "loss_recon": loss_recon,
+            "loss_kld": loss_kld,
+        }
+    ).to_csv(output_dir / "training_history.csv", index=False)
+    pd.DataFrame(
+        [
+            {
+                "model_type": config["model_type"],
+                "training_time_seconds": float(training_time_seconds),
+                "training_time_minutes": float(training_time_seconds / 60.0),
+            }
+        ]
+    ).to_csv(output_dir / "training_summary.csv", index=False)
+    with open(output_dir / "train_config.json", "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+    return checkpoint_path
+
+
+def save_evaluation_artifacts(
+    output_dir,
+    config,
+    test_results_df,
+    metrics_summary,
+    recon_means,
+    recon_stds,
+    test_wf,
+):
+    """
+    Function that saves the artifacts that might show up during testing 
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    test_results_df.to_csv(output_dir / "test_results.csv", index=False)
+    pd.DataFrame([metrics_summary]).to_csv(
+        output_dir / "metrics_summary.csv", index=False
+    )
+    np.savez(
+        output_dir / "test_predictions.npz",
+        noisy=test_wf.cpu().numpy(),
+        recon_mean=recon_means.cpu().numpy(),
+        recon_std=recon_stds.cpu().numpy(),
+    )
+    with open(output_dir / "eval_config.json", "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+
+
+def prepare_data(config):
+    """
+    Function that prepares the data from the csv 
+
+    Arguments: 
+    - config: variable that contains all the specifications that tell the code how to run the model
+
+    Returns: 
+    - library containing the necessary information pertaining to the extracted data 
+    """
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    waveforms, waveform_meta = load_waveforms(
+        config["csv_path"], max_examples=config["max_examples"]
+    )
+
+    # Grouped split by source waveform so both decays stay in the same set.
+    source_ids = waveform_meta[:, 0].astype(int)
+    unique_source_ids = np.unique(source_ids)
+    train_source_ids, test_source_ids = train_test_split(
+        unique_source_ids,
+        test_size=config["test_size"],
+        random_state=config["random_state"],
+        shuffle=True,
+    )
+    train_mask = np.isin(source_ids, train_source_ids)
+    test_mask = np.isin(source_ids, test_source_ids)
+
+    waveforms_np = waveforms.numpy()
+    train_wf_np = waveforms_np[train_mask]
+    test_wf_np = waveforms_np[test_mask]
+    train_meta = waveform_meta[train_mask]
+    test_meta = waveform_meta[test_mask]
+
+    train_wf = torch.tensor(train_wf_np, dtype=torch.float32)
+    test_wf = torch.tensor(test_wf_np, dtype=torch.float32)
+    train_wf_norm, _, _ = minmax_scale_per_waveform(train_wf)
+    test_wf_norm, test_wf_min, test_wf_max = minmax_scale_per_waveform(test_wf)
+    train_x = train_wf_norm.unsqueeze(-1)
+    loader = DataLoader(
+        TensorDataset(train_x), batch_size=config["batch_size"], shuffle=True
+    )
+    return {
+        "device": device,
+        "loader": loader,
+        "test_wf": test_wf,
+        "test_meta": test_meta,
+        "test_wf_norm": test_wf_norm,
+        "test_wf_min": test_wf_min,
+        "test_wf_max": test_wf_max,
+        "signal_length": int(train_wf.shape[1]),
+    }
+
+
+def build_model(config, device, signal_length):
+    """
+    Function that builds the model according to specifications
+
+    Arguments: 
+    - config: the specifications for the model
+    - device: where the calculations will be done 
+    - signal_length: length of the signal to be treated
+
+    Returns: 
+    - nothing but it builds the model
+    """
+    if config["model_type"] == "lstm":
+        hidden_dim = config["lstm_hidden_dim"]
+    else:
+        hidden_dim = config["linear_hidden_dim"]
+    return WindowVAE(
+        signal_length=signal_length,
+        hidden_dim=hidden_dim,
+        latent_dim=config["latent_dim"],
+        num_layers=config["num_layers"],
+        model_type=config["model_type"],
+    ).to(device)
+
+
+def load_training_history(output_dir):
+    """
+    Function that saves the training history of the model 
+
+    Arguments: 
+    - output_dir: contains different training history variables 
+
+    Returns: 
+    - lists containing the training history values  
+    """
+
+    history_path = Path(output_dir) / "training_history.csv"
+    if not history_path.exists():
+        return [], [], []
+    hist = pd.read_csv(history_path)
+    return (
+        hist["loss_total"].to_list(),
+        hist["loss_recon"].to_list(),
+        hist["loss_kld"].to_list(),
+    )
+
+
+def load_training_time_seconds(output_dir):
+    """
+    Function that records the time it takes to train the model 
+    """
+
+    summary_path = Path(output_dir) / "training_summary.csv"
+    if not summary_path.exists():
+        return 0.0
+    summary = pd.read_csv(summary_path)
+    if summary.empty or "training_time_seconds" not in summary.columns:
+        return 0.0
+    return float(summary.iloc[0]["training_time_seconds"])
+
+
+def resolve_model_output_dir(config):
+    """
+    Unsure what this does 
+    """
+    base = Path(config["output_dir"])
+    model_dir_name = str(config["model_type"])
+    if base.name == model_dir_name:
+        return base
+    return base / model_dir_name
+
+
+def resolve_checkpoint_path(config):
+    """Resolve checkpoint path consistently with model-specific output folders."""
+    model_output_dir = resolve_model_output_dir(config)
+    model_ckpt = model_output_dir / "model_weights.pt"
+    return model_ckpt
+
+
+def run_training(config, prepared=None):
+    """ 
+    Function that runs the training of the model 
+    """
+
+    prepared = prepare_data(config) if prepared is None else prepared
+    device = prepared["device"]
+    print(f"Using device: {device}")
+    model = build_model(config, device, signal_length=prepared["signal_length"])
+    optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
+    train_t0 = time.perf_counter()
+    loss_total, loss_recon, loss_kld = train_model(
+        model,
+        prepared["loader"],
+        optimizer,
+        num_epochs=config["num_epochs"],
+        device=device,
+    )
+    train_time_seconds = time.perf_counter() - train_t0
+    output_dir = resolve_model_output_dir(config)
+    ckpt_saved = save_training_artifacts(
+        output_dir=output_dir,
+        model=model,
+        config=config,
+        loss_total=loss_total,
+        loss_recon=loss_recon,
+        loss_kld=loss_kld,
+        training_time_seconds=train_time_seconds,
+    )
+    print(
+        f"Training time ({config['model_type']}): {train_time_seconds:.2f} s "
+        f"({train_time_seconds / 60.0:.2f} min)"
+    )
+    print(f"Saved training artifacts in: {output_dir}")
+    print(f"Checkpoint: {ckpt_saved}")
+    return {
+        "model": model,
+        "loss_total": loss_total,
+        "loss_recon": loss_recon,
+        "loss_kld": loss_kld,
+        "training_time_seconds": float(train_time_seconds),
+        "config": config,
+        "output_dir": str(output_dir),
+    }
+
+
+def run_evaluation(config, model=None, prepared=None):
+    """
+    Function that runs the testing and evaluation of the model 
+    """
+
+    prepared = prepare_data(config) if prepared is None else prepared
+    device = prepared["device"]
+    print(f"Using device: {device}")
+    if model is None:
+        model = build_model(config, device, signal_length=prepared["signal_length"])
+        ckpt_path = resolve_checkpoint_path(config)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"checkpoint_path not found: {ckpt_path}")
+        payload = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(payload["model_state_dict"])
+        print(f"Loaded checkpoint: {ckpt_path}")
+
+    recon_means, recon_stds, recon_means_norm, recon_stds_norm, test_results_df = (
+        predict_test_set(
+            model=model,
+            test_wf=prepared["test_wf"],
+            test_wf_norm=prepared["test_wf_norm"],
+            test_wf_min=prepared["test_wf_min"],
+            test_wf_max=prepared["test_wf_max"],
+            test_meta=prepared["test_meta"],
+            mc_samples=config["mc_samples"],
+            device=device,
+        )
+    )
+    metrics = compute_denoising_metrics(prepared["test_wf_norm"], recon_means_norm)
+    n2n_metrics = compute_neighbor2neighbor_metrics(
+        prepared["test_wf_norm"], recon_means_norm, prepared["test_meta"]
+    )
+    resid_metrics = residu_eval(
+        prepared["test_wf_norm"], recon_means_norm, prepared["test_meta"]
+    )
+    test_results_df["mae"] = metrics["mae_per_waveform"].cpu().numpy()
+    test_results_df["rmse"] = metrics["rmse_per_waveform"].cpu().numpy()
+    test_results_df["neighbor2neighbor_mse"] = n2n_metrics["n2n_per_example"]
+    test_results_df["residu"] = resid_metrics["resid_per_example"]
+
+    output_dir = resolve_model_output_dir(config)
+    training_time_seconds = load_training_time_seconds(output_dir)
+    loss_total, loss_recon, loss_kld = load_training_history(output_dir)
+
+    print(
+        "Dataset reconstruction uncertainty std stats: "
+        f"min={recon_stds.min().item():.6f}, max={recon_stds.max().item():.6f}, "
+        f"mean={recon_stds.mean().item():.6f}"
+    )
+    print(
+        f"Denoising metrics ({config['model_type']}): "
+        f"MAE(norm)={metrics['mae_mean']:.6f}±{metrics['mae_std']:.6f}, "
+        f"RMSE(norm)={metrics['rmse_mean']:.6f}±{metrics['rmse_std']:.6f}, "
+        f"N2N-MSE(norm)={n2n_metrics['n2n_mean']:.6f}±{n2n_metrics['n2n_std']:.6f} "
+        f"(sources={n2n_metrics['n2n_count_sources']})"
+    )
+
+    save_evaluation_artifacts(
+        output_dir=output_dir,
+        config=config,
+        test_results_df=test_results_df,
+        metrics_summary={
+            "model_type": config["model_type"],
+            "training_time_seconds": float(training_time_seconds),
+            "training_time_minutes": float(training_time_seconds / 60.0),
+            "mae_mean": metrics["mae_mean"],
+            "mae_std": metrics["mae_std"],
+            "rmse_mean": metrics["rmse_mean"],
+            "rmse_std": metrics["rmse_std"],
+            "n2n_mse_mean": n2n_metrics["n2n_mean"],
+            "n2n_mse_std": n2n_metrics["n2n_std"],
+            "n2n_count_sources": n2n_metrics["n2n_count_sources"],
+        },
+        recon_means=recon_means,
+        recon_stds=recon_stds,
+        test_wf=prepared["test_wf"],
+    )
+    print(f"Saved evaluation artifacts in: {output_dir}")
+
+    return {
+        "model": model,
+        "test_wf": prepared["test_wf"],
+        "test_meta": prepared["test_meta"],
+        "test_wf_norm": prepared["test_wf_norm"],
+        "test_wf_min": prepared["test_wf_min"],
+        "test_wf_max": prepared["test_wf_max"],
+        "test_results_df": test_results_df,
+        "recon_means": recon_means,
+        "recon_stds": recon_stds,
+        "metrics": {**metrics, **n2n_metrics},
+        "training_time_seconds": float(training_time_seconds),
+        "config": config,
+        "loss_total": loss_total,
+        "loss_recon": loss_recon,
+        "loss_kld": loss_kld,
+        "output_dir": str(output_dir),
+    }
+
+
+def run_experiment(config):
+    """Compatibility wrapper around separated training/evaluation pipelines."""
+    mode = config.get("pipeline_mode", "train_and_evaluate")
+    if mode == "train_only":
+        return run_training(config)
+    if mode == "evaluate_only":
+        return run_evaluation(config)
+    if mode == "train_and_evaluate":
+        prepared = prepare_data(config)
+        train_out = run_training(config, prepared=prepared)
+        return run_evaluation(config, model=train_out["model"], prepared=prepared)
+    raise ValueError(
+        f"Unsupported pipeline_mode={mode}. Use train_only, evaluate_only, or train_and_evaluate."
+    )
+
+
+def plot_training_losses_from_run_output(run_output):
+    """
+    Function that plots the losses from the training of the model
+    """
+
+    plot_training_losses(
+        loss_total=run_output["loss_total"],
+        loss_recon=run_output["loss_recon"],
+        loss_kld=run_output["loss_kld"],
+    )
+
+
+def plot_reconstruction_from_run_output(run_output, selected_idx=None):
+    """
+    Function that plots the reconstructed output values 
+    """
+
+    if selected_idx is None:
+        selected_idx = 0
+    if selected_idx < 0 or selected_idx >= len(run_output["test_wf"]):
+        raise ValueError(
+            f"selected_idx={selected_idx} out of range [0..{len(run_output['test_wf'])-1}]"
+        )
+
+    cfg = run_output["config"]
+    model = run_output["model"]
+    noisy = run_output["test_wf"][selected_idx]
+    recon_mean = run_output["recon_means"][selected_idx]
+    recon_std = run_output["recon_stds"][selected_idx]
+
+    source_waveform_idx = int(run_output["test_meta"][selected_idx, 0])
+    decay_id = int(run_output["test_meta"][selected_idx, 1])
+    decay_label = (
+        "first decay [450:750]" if decay_id == 0 else "second decay [1250:1550]"
+    )
+    print(
+        f"Plotting test example {selected_idx} from source waveform {source_waveform_idx}, "
+        f"decay {decay_id} ({decay_label})."
+    )
+
+    noisy_norm = run_output["test_wf_norm"][selected_idx]
+    _, _, recon_samples_norm = mc_reconstruct_waveform(
+        model,
+        noisy_norm,
+        mc_samples=cfg["mc_samples"],
+        device=next(model.parameters()).device,
+        return_samples=True,
+    )
+
+    waveform_min = run_output["test_wf_min"][selected_idx, 0]
+    waveform_max = run_output["test_wf_max"][selected_idx, 0]
+    waveform_range = (waveform_max - waveform_min).clamp_min(1e-6)
+    recon_samples_repr = recon_samples_norm * waveform_range + waveform_min
+    recon_samples_out = recon_samples_repr
+    ci_lower = torch.quantile(recon_samples_out, 0.025, dim=0)
+    ci_upper = torch.quantile(recon_samples_out, 0.975, dim=0)
+
+    plot_reconstruction_with_uncertainty(
+        noisy=noisy.cpu().numpy(),
+        recon_mean=recon_mean.cpu().numpy(),
+        recon_std=recon_std.cpu().numpy(),
+        ci_lower=ci_lower.cpu().numpy(),
+        ci_upper=ci_upper.cpu().numpy(),
+    )
+
+
+def plot_from_run_output(run_output, selected_idx=None):
+    plot_training_losses_from_run_output(run_output)
+    plot_reconstruction_from_run_output(run_output, selected_idx=selected_idx)
+
+
+def run_model_comparison(base_config, model_variants=("lstm", "linear")):
+    """
+    Function that compares the lstm and linear models with the same base configuration 
+    """
+
+    if base_config.get("pipeline_mode", "train_and_evaluate") == "train_only":
+        raise ValueError(
+            "run_model_comparison requires evaluation outputs. "
+            "Set pipeline_mode to 'train_and_evaluate' or 'evaluate_only'."
+        )
+    all_outputs = {}
+    rows = []
+    base_out = Path(base_config["output_dir"])
+    base_out.mkdir(parents=True, exist_ok=True)
+
+    for model_type in model_variants:
+        cfg = dict(base_config)
+        cfg["model_type"] = model_type
+        cfg["output_dir"] = str(base_out / model_type)
+        run_out = run_experiment(cfg)
+        all_outputs[model_type] = run_out
+        rows.append(
+            {
+                "model_type": model_type,
+                "training_time_seconds": run_out["training_time_seconds"],
+                "training_time_minutes": run_out["training_time_seconds"] / 60.0,
+                "mae_mean": run_out["metrics"]["mae_mean"],
+                "mae_std": run_out["metrics"]["mae_std"],
+                "rmse_mean": run_out["metrics"]["rmse_mean"],
+                "rmse_std": run_out["metrics"]["rmse_std"],
+                "n2n_mse_mean": run_out["metrics"]["n2n_mean"],
+                "n2n_mse_std": run_out["metrics"]["n2n_std"],
+            }
+        )
+
+    comparison_df = pd.DataFrame(rows).sort_values("rmse_mean").reset_index(drop=True)
+    comparison_df.to_csv(base_out / "comparison_metrics.csv", index=False)
+    pvalues_df = pd.DataFrame()
+    if base_config.get("pipeline_mode") != "train_only":
+        pvalues_df = compute_paired_pvalues(all_outputs)
+        if not pvalues_df.empty:
+            pvalues_df.to_csv(base_out / "comparison_pvalues.csv", index=False)
+            print(f"Saved paired p-values: {base_out / 'comparison_pvalues.csv'}")
+            print(pvalues_df)
+    else:
+        print("Skipping p-values (no evaluation outputs in train_only mode).")
+
+    print(f"Saved model comparison metrics: {base_out / 'comparison_metrics.csv'}")
+    print(comparison_df)
+    return all_outputs, comparison_df, pvalues_df
+
+
+def summarize_run_output(model_type, run_output):
+    row = {
+        "model_type": model_type,
+        "training_time_seconds": run_output["training_time_seconds"],
+        "training_time_minutes": run_output["training_time_seconds"] / 60.0,
+    }
+    if "metrics" in run_output:
+        row.update(
+            {
+                "mae_mean": run_output["metrics"]["mae_mean"],
+                "mae_std": run_output["metrics"]["mae_std"],
+                "rmse_mean": run_output["metrics"]["rmse_mean"],
+                "rmse_std": run_output["metrics"]["rmse_std"],
+                "n2n_mse_mean": run_output["metrics"]["n2n_mean"],
+                "n2n_mse_std": run_output["metrics"]["n2n_std"],
+            }
+        )
+    return row
+
+
+def compute_paired_pvalues(all_outputs):
+    """Paired Wilcoxon p-values for linear vs lstm (lower is better)."""
+    if "linear" not in all_outputs or "lstm" not in all_outputs:
+        return pd.DataFrame()
+
+    def paired_wilcoxon(a, b, metric_name):
+        a_np = np.asarray(a, dtype=float)
+        b_np = np.asarray(b, dtype=float)
+        valid = np.isfinite(a_np) & np.isfinite(b_np)
+        a_np = a_np[valid]
+        b_np = b_np[valid]
+        row = {
+            "metric": metric_name,
+            "model_a": "linear",
+            "model_b": "lstm",
+            "alternative": "linear_less_than_lstm",
+            "n_pairs": int(len(a_np)),
+            "mean_diff_a_minus_b": float(np.mean(a_np - b_np)) if len(a_np) else np.nan,
+            "median_diff_a_minus_b": (
+                float(np.median(a_np - b_np)) if len(a_np) else np.nan
+            ),
+            "statistic": np.nan,
+            "p_value": np.nan,
+            "note": "",
+        }
+        if len(a_np) == 0:
+            row["note"] = "No finite paired values."
+            return row
+        if wilcoxon is None:
+            row["note"] = "scipy not available; p-value not computed."
+            return row
+        stat = wilcoxon(a_np, b_np, alternative="less", zero_method="wilcox")
+        row["statistic"] = float(stat.statistic)
+        row["p_value"] = float(stat.pvalue)
+        return row
+
+    linear_metrics = all_outputs["linear"]["metrics"]
+    lstm_metrics = all_outputs["lstm"]["metrics"]
+    rows = [
+        paired_wilcoxon(
+            linear_metrics["mae_per_waveform"].detach().cpu().numpy(),
+            lstm_metrics["mae_per_waveform"].detach().cpu().numpy(),
+            "mae_norm",
+        ),
+        paired_wilcoxon(
+            linear_metrics["rmse_per_waveform"].detach().cpu().numpy(),
+            lstm_metrics["rmse_per_waveform"].detach().cpu().numpy(),
+            "rmse_norm",
+        ),
+        paired_wilcoxon(
+            linear_metrics["n2n_per_example"],
+            lstm_metrics["n2n_per_example"],
+            "n2n_mse_norm_abs",
+        ),
+    ]
+    return pd.DataFrame(rows)
+
+
+CONFIG = {
+    "run_both_models": True,
+    "model_variants": ["lstm", "linear"],
+    "pipeline_mode": "train_and_evaluate",  # train_only | evaluate_only | train_and_evaluate
+    "output_dir": "outputs/vae_v4_cb",
+    "model_type": "lstm",
+    "csv_path": "test_L44E.csv", # change pour chercher dans data
+    "max_examples": None,
+    "test_size": 0.2,
+    "random_state": 42,
+    "batch_size": 32,
+    "num_epochs": 100,
+    "lstm_hidden_dim": 64, # 64 hidden dim permet d'avoir qqch de comaprable avec feedforward
+    "linear_hidden_dim": 57,
+    "latent_dim": 2,
+    "num_layers": 1,
+    "lr": 1e-3,
+    "mc_samples": 10,
+}
+
+# Main outputs exposed at module scope for downstream quantitative analysis.
+if CONFIG["run_both_models"]:
+    RUN_OUTPUTS, COMPARISON_DF, PVALUES_DF = run_model_comparison(
+        CONFIG, model_variants=tuple(CONFIG["model_variants"])
+    )
+    RUN_OUTPUT = RUN_OUTPUTS[CONFIG["model_variants"][0]]
+else:
+    RUN_OUTPUT = run_experiment(CONFIG)
+    RUN_OUTPUTS = {CONFIG["model_type"]: RUN_OUTPUT}
+    COMPARISON_DF = pd.DataFrame(
+        [summarize_run_output(CONFIG["model_type"], RUN_OUTPUT)]
+    )
+    PVALUES_DF = pd.DataFrame()
+
+TRAINED_MODEL = RUN_OUTPUT["model"]
+TEST_RESULTS_DF = RUN_OUTPUT.get("test_results_df")
+TEST_RECON_MEAN = RUN_OUTPUT.get("recon_means")
+TEST_RECON_STD = RUN_OUTPUT.get("recon_stds")
+
+if "test_wf" in RUN_OUTPUT:
+    for model_name, model_output in RUN_OUTPUTS.items():
+        if "test_wf" in model_output:
+            print(f"\nPlotting outputs for model_type={model_name}")
+            plot_from_run_output(model_output, selected_idx=1)
+
+# Simple end-of-script comparison plot: total loss (Linear vs LSTM), up to 100 epochs.
+if "linear" in RUN_OUTPUTS and "lstm" in RUN_OUTPUTS:
+    linear_loss = RUN_OUTPUTS["linear"].get("loss_total", [])
+    lstm_loss = RUN_OUTPUTS["lstm"].get("loss_total", [])
+    max_epochs = min(100, len(linear_loss), len(lstm_loss))
+    if max_epochs > 0:
+        epochs = np.arange(1, max_epochs + 1)
+        fig, ax = plt.subplots(figsize=(5, 4))
+        plt.plot(epochs, linear_loss[:max_epochs], label="Feedforward")
+        plt.plot(epochs, lstm_loss[:max_epochs], label="Recurrent")
+        plt.xlabel("Training epoch")
+        plt.ylabel("Total loss (NLL + KLD)")
+        ax.set_xscale("log")
+        ax.text(-0.2, 0.98, "(b)", transform=ax.transAxes, ha="left", va="top")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("loss_comparison.png", dpi=300)
+        plt.show()
+    else:
+        print("Skipping Linear vs LSTM loss plot: training histories not available.")
+
+# Simple end-of-script comparison plot: one noisy waveform with LSTM/Linear reconstructions.
+if "linear" in RUN_OUTPUTS and "lstm" in RUN_OUTPUTS:
+    linear_out = RUN_OUTPUTS["linear"]
+    lstm_out = RUN_OUTPUTS["lstm"]
+    if "test_wf" in linear_out and "test_wf" in lstm_out:
+        n_examples = min(len(linear_out["test_wf"]), len(lstm_out["test_wf"]))
+        selected_idx = 14
+        if n_examples > selected_idx:
+            noisy = linear_out["test_wf"][selected_idx].detach().cpu().numpy()
+            recon_lstm = lstm_out["recon_means"][selected_idx].detach().cpu().numpy()
+            recon_linear = (
+                linear_out["recon_means"][selected_idx].detach().cpu().numpy()
+            )
+            x = np.arange(len(noisy))
+
+            fig, ax = plt.subplots(figsize=(5, 4))
+            plt.plot(x, noisy, "k.", alpha=0.2, label="Noisy input")
+            plt.plot(x, recon_linear, lw=2, ls="-", label="Feedforward")
+            plt.plot(x, recon_lstm, lw=2, ls="--", label="Recurrent")
+            plt.xlabel("Voltage sample index (100 Hz)")
+            plt.ylabel("Voltage (mV)")
+            ax.text(-0.15, 0.98, "(a)", transform=ax.transAxes, ha="left", va="top")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig("reconstruction_comparison.png", dpi=300)
+            plt.show()
+        else:
+            print("Skipping reconstruction comparison plot: test set is empty.")
+    else:
+        print(
+            "Skipping reconstruction comparison plot: evaluation outputs not available."
+        )
+
+# Simple end-of-script evaluation plot: compare the residuals of the two models for all the decays
+if "linear" in RUN_OUTPUTS and "lstm" in RUN_OUTPUTS:
+    linear_out = RUN_OUTPUTS["linear"]
+    lstm_out = RUN_OUTPUTS["lstm"]
+    if "test_wf" in linear_out and "test_wf" in lstm_out:
+        n_examples = min(len(linear_out["test_wf"]), len(lstm_out["test_wf"]))
+        if n_examples > selected_idx:
+            # extract data 
+            noisy_resid = linear_out["test_wf"].detach().cpu()
+            recon_lstm_resid = lstm_out["recon_means"].detach().cpu()
+            recon_linear_resid = (linear_out["recon_means"].detach().cpu())
+
+            # compute the residues and their means and variances 
+            residues_linear = minmax_scale_per_waveform(noisy_resid)[0] - minmax_scale_per_waveform(recon_linear_resid)[0]
+            residues_lstm = minmax_scale_per_waveform(noisy_resid)[0] - minmax_scale_per_waveform(recon_lstm_resid)[0]
+            residues_linear_fl = residues_linear.flatten()
+            residues_lstm_fl = residues_lstm.flatten()
+            residues_linear_avg = residues_linear.mean(0)
+            residues_lstm_avg = residues_lstm.mean(0)
+            residues_linear_var = torch.var(residues_linear, axis=0)
+            residues_lstm_var = torch.var(residues_lstm, axis=0)
+
+
+            # plot the histogram of the residues for both models
+            x_hist = np.linspace(residues_linear_fl.min(), residues_linear_fl.max(), 1000)
+            fig, ax = plt.subplots(figsize=(5, 4))
+            plt.hist(residues_linear_fl, bins=50, alpha=0.5, label="Feedforward residuals")
+            plt.hist(residues_lstm_fl, bins=50, alpha=0.5, label="Recurrent residuals")
+            plt.xlabel("Residue value (mV)")
+            plt.ylabel("Frequency")
+            ax.text(-0.15, 0.98, "(a)", transform=ax.transAxes, ha="left", va="top")
+            plt.legend()
+            plt.tight_layout()
+            plt.title("Distribution of reconstruction residues")
+            plt.show()
+
+            # plot the residues en fonction of the the voltage sample index
+            x_sample = np.arange(len(residues_linear_avg))
+            fix1, ax1 = plt.subplots(figsize=(5, 4))
+            plt.plot(x_sample, residues_linear_avg, label="Feedforward residuals", alpha=0.5)
+            plt.plot(x_sample, residues_lstm_avg, label="Recurrent residuals", alpha=0.5)
+            plt.xlabel("Voltage sample index (100 Hz)")
+            plt.ylabel("Residue value (mV)")
+            plt.legend()
+            plt.tight_layout()
+            plt.title("Evolution of residues across voltage samples")
+            ax.text(-0.15, 0.98, "(a)", transform=ax.transAxes, ha="left", va="top")
+            plt.show()
+
+            # check correlogram of the residues for both models
+            series_linear = Series(residues_linear_avg)
+            series_lstm = Series(residues_lstm_avg)
+            fig2, ax2 = plt.subplots(figsize=(5, 4))
+            autocorrelation_plot(series_linear, label="Feedforward residuals", ax=ax2)
+            autocorrelation_plot(series_lstm, label="Recurrent residuals", ax=ax2)
+            plt.xlabel("Lag")
+            plt.ylabel("Autocorrelation")
+            plt.legend()
+            plt.tight_layout()
+            plt.title("Correlogram of reconstruction residues")
+            plt.show()
+
+            # do a fourier transform 
+            N = len(residues_linear_avg)
+            residues_linear_fourier = np.abs(fft(residues_linear_avg))
+            residues_lstm_fourier = np.abs(fft(residues_lstm_avg))
+            freq = fftfreq(N, d=1/100)
+            # Take only positive frequencies (first half of the spectrum)
+            pos = freq > 0.0
+            freq_pos = freq[pos]
+            residues_linear_fourier_pos = residues_linear_fourier[pos]
+            residues_lstm_fourier_pos = residues_lstm_fourier[pos]
+            fig3, ax3 = plt.subplots(figsize=(5, 4))
+            plt.semilogy(freq_pos, residues_linear_fourier_pos**2, label="Feedforward residuals", alpha=0.5)
+            plt.semilogy(freq_pos, residues_lstm_fourier_pos, label="Recurrent residuals", alpha=0.5)
+            plt.xlabel("Frequency (Hz)")
+            plt.ylabel("Fourier Transform")
+            plt.legend()
+            plt.tight_layout()
+            plt.title("Fourier transform of reconstruction residues")
+            plt.show()
+
+            # variance of the residues for both models
+            fix4, ax4 = plt.subplots(figsize=(5, 4))
+            plt.plot(x_sample, residues_linear_var, label="Feedforward residuals variance", alpha=0.5)
+            plt.plot(x_sample, residues_lstm_var, label="Recurrent residuals variance", alpha=0.5)
+            plt.xlabel("Voltage sample index (100 Hz)")
+            plt.ylabel("Residue value (mV)")
+            plt.legend()
+            plt.tight_layout()
+            ax4.text(-0.15, 0.98, "(a)", transform=ax4.transAxes, ha="left", va="top")
+            plt.title("Variance of reconstruction residues across voltage samples")
+            plt.show()
+        else:
+            print("Skipping reconstruction comparison plot: test set is empty.")
+    else:
+        print(
+            "Skipping reconstruction comparison plot: evaluation outputs not available."
+        )
+
+if "linear" in RUN_OUTPUTS and "lstm" in RUN_OUTPUTS:
+    linear_out = RUN_OUTPUTS["linear"]
+    lstm_out = RUN_OUTPUTS["lstm"]
+    if "test_wf" in linear_out and "test_wf" in lstm_out:
+        n_examples = min(len(linear_out["test_wf"]), len(lstm_out["test_wf"]))
+        # select 5 index to study from the multiple 
+        sample_indexs = np.random.choice(range(0, n_examples), 5)
+        print(sample_indexs)
+
+        if n_examples > selected_idx:
+            noisy_resid2 = linear_out["test_wf"].detach().cpu()
+            recon_lstm_resid2 = lstm_out["recon_means"].detach().cpu()
+            recon_linear_resid2 = (linear_out["recon_means"].detach().cpu())
+            # compute the residues and their means and variances 
+            residues_linear2 = minmax_scale_per_waveform(noisy_resid2)[0] - minmax_scale_per_waveform(recon_linear_resid2)[0]
+            residues_lstm2 = minmax_scale_per_waveform(noisy_resid2)[0] - minmax_scale_per_waveform(recon_lstm_resid2)[0]
+            residues_linear_fl2 = residues_linear2[sample_indexs].flatten()
+            residues_lstm_fl2 = residues_lstm2[sample_indexs].flatten()
+            residues_linear_avg = residues_linear2[sample_indexs]
+            residues_lstm_avg = residues_lstm2[sample_indexs]
+
+            # plot the residues en fonction of the the voltage sample index
+            x_sample = np.arange(residues_linear_avg.shape[1])
+            fig6, ax6= plt.subplots(ncols=1, nrows=5)
+            ax6[0].plot(x_sample, residues_linear_avg[0], label="Feedforward residuals", alpha=0.5)
+            ax6[0].plot(x_sample, residues_lstm_avg[0], label="Recurrent residuals", alpha=0.5)
+            ax6[1].plot(x_sample, residues_linear_avg[1], alpha=0.5)
+            ax6[1].plot(x_sample, residues_lstm_avg[1], alpha=0.5)
+            ax6[2].plot(x_sample, residues_linear_avg[2], alpha=0.5)
+            ax6[2].plot(x_sample, residues_lstm_avg[2], alpha=0.5)
+            ax6[3].plot(x_sample, residues_linear_avg[3], alpha=0.5)
+            ax6[3].plot(x_sample, residues_lstm_avg[3], alpha=0.5)
+            ax6[4].plot(x_sample, residues_linear_avg[4], alpha=0.5)
+            ax6[4].plot(x_sample, residues_lstm_avg[4], alpha=0.5)
+            for axs in ax6.flat:
+                axs.set(xlabel="Voltage sample index (100 Hz)")
+                axs.label_outer()
+            plt.legend()
+            # plt.tight_layout()
+            fig6.suptitle("Evolution of residues across voltage samples 2")
+            # ax.text(-0.15, 0.98, "(a)", transform=ax.transAxes, ha="left", va="top")
+            plt.show()
+
+            # check correlogram of the residues for both models
+            series_linear=[Series(i) for i in residues_linear_avg]
+            series_lstm=[Series(j) for j in residues_lstm_avg]
+            fig7, ax7 = plt.subplots(ncols=1, nrows=5)
+            autocorrelation_plot(series_linear[0],  ax=ax7[0], alpha=0.5)
+            autocorrelation_plot(series_lstm[0],  ax=ax7[0], alpha=0.5)
+            autocorrelation_plot(series_linear[1],  ax=ax7[1], alpha=0.5)
+            autocorrelation_plot(series_lstm[1],  ax=ax7[1], alpha=0.5)
+            autocorrelation_plot(series_linear[2],  ax=ax7[2], alpha=0.5)
+            autocorrelation_plot(series_lstm[2],  ax=ax7[2], alpha=0.5)
+            autocorrelation_plot(series_linear[3],  ax=ax7[3], alpha=0.5)
+            autocorrelation_plot(series_lstm[3],  ax=ax7[3], alpha=0.5)
+            autocorrelation_plot(series_linear[4], ax=ax7[4], alpha=0.5)
+            autocorrelation_plot(series_lstm[4],  ax=ax7[4], alpha=0.5)
+            for axs in ax7.flat:
+                axs.set(xlabel="Lag")
+                axs.label_outer()
+            fig7.legend()
+            # plt.tight_layout()
+            fig7.suptitle("Correlogram of reconstruction residues 2")
+            # ax.text(-0.15, 0.98, "(a)", transform=ax.transAxes, ha="left", va="top")
+            plt.show()
+            
+            # do a fourier transform 
+            N = residues_linear_avg.shape[1]
+            residues_linear_fourier0 = np.abs(fft(residues_linear_avg[0])) 
+            residues_lstm_fourier0 = np.abs(fft(residues_lstm_avg[0]))
+            residues_linear_fourier1 = np.abs(fft(residues_linear_avg[1])) 
+            residues_lstm_fourier1 = np.abs(fft(residues_lstm_avg[1]))
+            residues_linear_fourier2 = np.abs(fft(residues_linear_avg[2])) 
+            residues_lstm_fourier2 = np.abs(fft(residues_lstm_avg[2]))
+            residues_linear_fourier3 = np.abs(fft(residues_linear_avg[3])) 
+            residues_lstm_fourier3 = np.abs(fft(residues_lstm_avg[3]))
+            residues_linear_fourier4 = np.abs(fft(residues_linear_avg[4])) 
+            residues_lstm_fourier4 = np.abs(fft(residues_lstm_avg[4]))
+            freq = fftfreq(N, d=1/100)
+            # Take only positive frequencies (first half of the spectrum)
+            pos = freq > 0.0
+            freq_pos = freq[pos]
+            residues_linear_fourier_pos0 = residues_linear_fourier0[pos]
+            residues_lstm_fourier_pos0 = residues_lstm_fourier0[pos]
+            residues_linear_fourier_pos1 = residues_linear_fourier1[pos]
+            residues_lstm_fourier_pos1 = residues_lstm_fourier1[pos]
+            residues_linear_fourier_pos2 = residues_linear_fourier2[pos]
+            residues_lstm_fourier_pos2 = residues_lstm_fourier2[pos]
+            residues_linear_fourier_pos3 = residues_linear_fourier3[pos]
+            residues_lstm_fourier_pos3 = residues_lstm_fourier3[pos]
+            residues_linear_fourier_pos4 = residues_linear_fourier4[pos]
+            residues_lstm_fourier_pos4 = residues_lstm_fourier4[pos]
+            fig8, ax8 = plt.subplots(ncols=1, nrows=5)
+            ax8[0].loglog(freq_pos, residues_linear_fourier_pos0, label="Feedforward residuals", alpha=0.5)
+            ax8[0].loglog(freq_pos, residues_lstm_fourier_pos0, label="Recurrent residuals", alpha=0.5)
+            ax8[1].loglog(freq_pos, residues_linear_fourier_pos1,  alpha=0.5)
+            ax8[1].loglog(freq_pos, residues_lstm_fourier_pos1,  alpha=0.5)
+            ax8[2].loglog(freq_pos, residues_linear_fourier_pos2,  alpha=0.5)
+            ax8[2].loglog(freq_pos, residues_lstm_fourier_pos2,  alpha=0.5)
+            ax8[3].loglog(freq_pos, residues_linear_fourier_pos3,  alpha=0.5)
+            ax8[3].loglog(freq_pos, residues_lstm_fourier_pos3,  alpha=0.5)
+            ax8[4].loglog(freq_pos, residues_linear_fourier_pos4, alpha=0.5)
+            ax8[4].loglog(freq_pos, residues_lstm_fourier_pos4, alpha=0.5)
+            for axs in ax8.flat:
+                axs.set(xlabel="Frequency (Hz)")
+                axs.label_outer()
+            fig8.legend()
+            # plt.tight_layout()
+            fig8.suptitle("Fourier transform of reconstruction residues 2")
+            # ax.text(-0.15, 0.98, "(a)", transform=ax.transAxes, ha="left", va="top")
+            plt.show()
+        else:
+                print("Skipping reconstruction comparison plot: test set is empty.")    
+        
+    else:
+        print(
+            "Skipping reconstruction comparison plot: evaluation outputs not available."
+        )
+
+if "linear" in RUN_OUTPUTS and "lstm" in RUN_OUTPUTS:
+    linear_out = RUN_OUTPUTS["linear"]
+    lstm_out = RUN_OUTPUTS["lstm"]
+    if "test_wf" in linear_out and "test_wf" in lstm_out:
+        n_examples = min(len(linear_out["test_wf"]), len(lstm_out["test_wf"]))
+
+        if n_examples > selected_idx:
+            noisy_resid3 = linear_out["test_wf"].detach().cpu()
+            recon_lstm_resid3 = lstm_out["recon_means"].detach().cpu()
+            recon_linear_resid3 = (linear_out["recon_means"].detach().cpu())
+            # compute the residues and their means and variances 
+            residues_linear3 = minmax_scale_per_waveform(noisy_resid3)[0] - minmax_scale_per_waveform(recon_linear_resid3)[0]
+            residues_lstm3 = minmax_scale_per_waveform(noisy_resid3)[0] - minmax_scale_per_waveform(recon_lstm_resid3)[0]
+            # residues_linear = residues_linear[sample_indexs]
+            # residues_lstm = residues_lstm[sample_indexs]
+            
+            # do a fourier transform and keep only the positive frequencies
+            N = residues_linear3.shape[1]
+            freq = fftfreq(N, d=1/100)
+            # Take only positive frequencies (first half of the spectrum)
+            positive = freq > 0.0
+            freq_pos3 = freq[positive]
+            residues_linear_fourier = np.empty([residues_linear3.shape[0], N//2-1])
+            residues_lstm_fourier = np.empty([residues_lstm3.shape[0], N//2-1])
+            for i in range(residues_linear3.shape[0]):
+                residues_linear_fourier[i] = np.abs(fft(residues_linear3[i]))[positive]
+                residues_lstm_fourier[i] = np.abs(fft(residues_lstm3[i]))[positive]
+            
+            # make sure there are no problematic values in the arrays
+            residues_linear_fourier = np.maximum(residues_linear_fourier, 1e-12)
+            residues_lstm_fourier = np.maximum(residues_lstm_fourier, 1e-12)
+            # calculate the slope of the fourier transform in log-log scale for both models
+            slope_lin = []
+            slope_lstm = []
+            for j in range(residues_linear3.shape[0]):
+                slp_lin, _ = np.polyfit(np.log10(freq_pos3), np.log10(residues_linear_fourier[j]**2), 1)
+                slp_lstm, _ = np.polyfit(np.log10(freq_pos), np.log10(residues_lstm_fourier[j]**2), 1)
+                slope_lin.append(slp_lin)
+                slope_lstm.append(slp_lstm)
+            # plot the histogram of the residues for both models
+            x_hist = np.linspace(min(slope_lin), max(slope_lin), 1000)
+            fig, ax = plt.subplots(figsize=(5, 4))
+            plt.hist(slope_lstm, bins=50, alpha=0.5, label="Recurrent residuals")
+            plt.hist(slope_lin, bins=50, alpha=0.5, label="Feedforward residuals")
+            plt.xlabel("Slope value")
+            plt.ylabel("Frequency")
+            ax.text(-0.15, 0.98, "(a)", transform=ax.transAxes, ha="left", va="top")
+            plt.legend()
+            # plt.tight_layout()
+            plt.title("Distribution of fourier slopes")
+            plt.show()
+        
+        else:
+                print("Skipping reconstruction comparison plot: test set is empty.")    
+        
+    else:
+        print(
+            "Skipping reconstruction comparison plot: evaluation outputs not available."
+        ) 

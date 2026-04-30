@@ -4,7 +4,7 @@
     "lstm",
     "linear"
   ],
-  "pipeline_mode": "evaluate_only",
+  "pipeline_mode": "train_and_evaluate",
   "output_dir": "outputs/vae_v4_cb/lstm",
   "model_type": "lstm",
   "csv_path": "test_L44E.csv",
